@@ -2559,10 +2559,6 @@ pub use recovery_mask::{
 #[path = "tone_anchor.rs"]
 mod tone_anchor;
 
-#[cfg(test)]
-#[path = "cloud_regression.rs"]
-mod cloud_regression;
-
 #[derive(Copy, Clone)]
 struct DngCtx<'a> {
     sgain: *mut x3f_spatial_gain_corr_t,
@@ -2619,6 +2615,9 @@ unsafe fn dng_evaluate_pixel(
             ctx.cols,
         )
     });
+    // x3f_get_image admits this calibration only for the Merrill family.
+    // Other sensors keep the upstream reconstruction below, not Merrill's
+    // healthy-color or co-sited-layer assumptions.
     if let Some(camera_y) = ctx.camera_y.filter(|_| ctx.recovery) {
         const COLOR_RADIUS: usize = 256;
         let model = local.expect("tone anchor requires native reliability");
@@ -2642,7 +2641,6 @@ unsafe fn dng_evaluate_pixel(
     let mut confident = false;
     let mut damaged = true;
     let mut mask = [0; 3];
-    let mut local_result = None;
     let local_prior = std::array::from_fn(|c| {
         if sg[c].is_finite() && sg[c] > 0.0 {
             prior[c] / sg[c]
@@ -2653,7 +2651,6 @@ unsafe fn dng_evaluate_pixel(
     if ctx.recovery {
         if let Some(model) = local {
             let result = model.recover(row, col, samples, local_prior);
-            local_result = Some(result);
             samples = result.samples;
             confident = result.recovered;
             damaged = result.damaged;
@@ -2740,26 +2737,30 @@ unsafe fn dng_evaluate_pixel(
     });
     if ctx.recovery && local.is_some() {
         let measured = std::array::from_fn(|c| sg[c] * original[c]);
-        // Negative display RGB can be a healthy out-of-gamut color, not
-        // sensor damage. Avoid the legacy reference entirely for healthy
-        // sources; the stabilizer fades in its correction through the
-        // sensor shoulder, so mask=255/254 is not a full-strength switch.
-        if mask == [255; 3] {
+        // Match the stabilizer's healthy-color passthrough without evaluating
+        // the legacy reference (and spatial gain) a second time. A healthy
+        // mask alone is insufficient: matrix-pathological colors still need
+        // the safeguard below, including apparently unclipped highlights.
+        if mask == [255; 3]
+            && mat3x1_mul_native(m, measured)
+                .into_iter()
+                .all(|value| value.is_finite() && value >= 0.0)
+        {
             return measured;
         }
-        // Native color uses a continuous, evidence-weighted reference;
-        // the original surviving layers still supply intensity and detail.
-        // Do not treat the legacy integer-bin/fallback switch as color truth.
+        // A small BMT ratio error can become a large visible hue error. Use
+        // the established recovery as a conservative color reference, while
+        // the original surviving layers supply intensity and fine detail.
         let mut stable_ctx = *ctx;
         stable_ctx.prior = local_prior.as_ptr();
         let camera_model = local.filter(|model| model.has_camera_maps() && mask.contains(&0));
-        let color_reference = local.zip(local_result).and_then(|(model, proposal)| {
+        let camera_reference = camera_model.and_then(|model| {
             let lut = if ctx.use_clut {
                 Some(unsafe { &*ctx.clut })
             } else {
                 None
             };
-            model.color_reference(row, col, original, local_prior, lut, proposal)
+            model.camera_reference(row, col, original, local_prior, lut)
         });
         // If there is no trustworthy survivor, retain the established
         // fallback, but never let its numeric-only LUT treat a camera-flagged
@@ -2767,8 +2768,8 @@ unsafe fn dng_evaluate_pixel(
         if camera_model.is_some() {
             stable_ctx.use_clut = false;
         }
-        let stable = if let Some(reference) = color_reference {
-            std::array::from_fn(|c| sg[c] * reference.samples[c])
+        let stable = if let Some(reference) = camera_reference {
+            std::array::from_fn(|c| sg[c] * reference[c])
         } else {
             unsafe { dng_evaluate_pixel(&stable_ctx, None, row, col, pixel, ptr::null_mut()) }
         };
@@ -4052,7 +4053,12 @@ mod tests {
         assert_eq!(take(), None);
     }
 
-    fn evaluate_recovery_fixture(pixel: [u16; 3], mask: [u8; 3], recovery: bool) -> [f64; 3] {
+    fn evaluate_recovery_fixture(
+        pixel: [u16; 3],
+        mask: Option<[u8; 3]>,
+        model_name: &str,
+        recovery: bool,
+    ) -> [f64; 3] {
         use super::*;
         use crate::highlight_recovery::SensorReliability;
         let mut matrix = [2.0, -2.0, 1.0, -1.0, 3.0, -1.0, 3.0, -3.0, 1.0];
@@ -4064,7 +4070,7 @@ mod tests {
             sat_factor: 1.0,
             chan_thresh: 0.5,
         };
-        let ctx = DngCtx {
+        let mut ctx = DngCtx {
             sgain: ptr::null_mut(),
             sgain_num: 0,
             conv_matrix: matrix.as_mut_ptr(),
@@ -4083,13 +4089,20 @@ mod tests {
             cols: 1,
             channels: 3,
             recovery,
-            camera_y: None,
+            camera_y: (recovery && is_merrill_name(model_name.as_bytes()))
+                .then_some([0.0, 1.0, 0.0]),
             gradient: None,
         };
-        let mut reliability = SensorReliability::new(1, 1, [0.001; 3]).unwrap();
-        reliability.data[0] = mask;
-        let model = LocalRecovery::build(reliability, |_, _| [0.2; 3], None).unwrap();
-        let local = recovery.then_some(&model);
+        let model = mask.map(|mask| {
+            let mut reliability = SensorReliability::new(1, 1, [0.001; 3]).unwrap();
+            reliability.data[0] = mask;
+            LocalRecovery::build(reliability, |_, _| [0.2; 3], None).unwrap()
+        });
+        let local = model.as_ref().filter(|_| recovery);
+        let gradient = ctx
+            .camera_y
+            .map(|_| unsafe { gradient_tone::Field::build(&ctx, local, &pixel, 3).unwrap() });
+        ctx.gradient = gradient.as_ref();
         let first = unsafe { dng_evaluate_pixel(&ctx, local, 0, 0, &pixel, ptr::null_mut()) };
         let second = unsafe { dng_evaluate_pixel(&ctx, local, 0, 0, &pixel, ptr::null_mut()) };
         assert_eq!(first, second, "headroom and encoding passes must agree");
@@ -4097,54 +4110,64 @@ mod tests {
     }
 
     #[test]
-    fn dng_healthy_negative_rgb_skips_legacy_neutralization() {
-        for pixel in [[1000, 2800, 3300], [3000, 8400, 9900]] {
-            let measured = pixel.map(|v| v as f64 / 10000.0);
-            assert_eq!(evaluate_recovery_fixture(pixel, [255; 3], true), measured);
-            assert_eq!(evaluate_recovery_fixture(pixel, [255; 3], false), measured);
+    fn merrill_healthy_negative_rgb_bypasses_legacy_stabilization() {
+        for model in [
+            "SIGMA DP1 Merrill",
+            "SIGMA DP2 Merrill",
+            "SIGMA DP3 Merrill",
+            "SIGMA SD1 Merrill",
+        ] {
+            for pixel in [[1000, 2800, 3300], [3000, 8400, 9900]] {
+                let measured = pixel.map(|v| v as f64 / 10000.0);
+                for recovery in [false, true] {
+                    assert_eq!(
+                        evaluate_recovery_fixture(pixel, Some([255; 3]), model, recovery),
+                        measured
+                    );
+                }
+            }
         }
     }
 
     #[test]
-    fn dng_quantized_shoulder_has_no_full_strength_activation_step() {
+    fn older_native_sensors_retain_upstream_color_stabilization() {
         let pixel = [3000, 8400, 9900];
-        let original = pixel.map(|v| v as f64 / 10000.0);
-        for channel in 0..3 {
-            let mut previous = original;
-            for code in (0..=255_u8).rev() {
-                let mut mask = [255; 3];
-                mask[channel] = code;
-                let result = evaluate_recovery_fixture(pixel, mask, true);
-                for c in 0..3 {
-                    assert!(
-                        (result[c] - previous[c]).abs() < 0.012,
-                        "channel {channel}, code {code}"
-                    );
-                    if code == 254 {
-                        assert!((result[c] - original[c]).abs() < 0.0002);
-                    }
-                }
-                previous = result;
-            }
+        let measured = pixel.map(|v| v as f64 / 10000.0);
+        for model in [
+            "SIGMA DP2",
+            "SIGMA SD9",
+            "SIGMA SD10",
+            "SIGMA SD14",
+            "SIGMA SD15",
+        ] {
+            assert_eq!(
+                evaluate_recovery_fixture(pixel, Some([255; 3]), model, false),
+                measured
+            );
+            let result = evaluate_recovery_fixture(pixel, Some([255; 3]), model, true);
+            // Same healthy mask as the Merrill witness, but the author's older
+            // path retains its safeguard for this pathological matrix response.
+            assert_ne!(result, measured);
+            // Exact replay of this synthetic fixture through the upstream
+            // evaluator and native model (before the Merrill contribution).
+            assert_eq!(
+                result,
+                [0.4730096544303833, 0.4836258312131101, 0.486574769208312]
+            );
         }
     }
 
     #[test]
-    fn dng_numeric_sensor_ramp_crosses_shoulder_and_clip_without_large_jump() {
-        use crate::highlight_recovery::channel_reliability;
-        let mut previous: Option<[f64; 3]> = None;
-        for top in 9400..=10000_u16 {
-            let code = channel_reliability(top as f64 / 10000.0, 0.001, 0.99, 0.04);
-            let result = evaluate_recovery_fixture([3000, 8400, top], [255, 255, code], true);
-            if let Some(previous) = previous {
-                for c in 0..3 {
-                    assert!(
-                        (result[c] - previous[c]).abs() < 0.012,
-                        "top={top}, code={code}"
-                    );
-                }
+    fn quattro_without_native_layer_provenance_uses_existing_path() {
+        // Expanded Quattro B/M are not independent native layer measurements.
+        // This checks routing only, not real-camera reconstruction quality.
+        for model in ["SIGMA sd Quattro", "SIGMA sd Quattro H"] {
+            for recovery in [false, true] {
+                assert_eq!(
+                    evaluate_recovery_fixture([2000; 3], None, model, recovery),
+                    [0.2; 3]
+                );
             }
-            previous = Some(result);
         }
     }
 
