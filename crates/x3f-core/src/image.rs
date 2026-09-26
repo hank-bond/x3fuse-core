@@ -99,13 +99,48 @@ impl Image {
     }
 }
 
+fn uses_dng_recovery(opts: &ProcessOptions) -> bool {
+    opts.dng_highlight_recovery && opts.color_encoding == crate::ColorEncoding::None && !opts.cineon
+}
+
+fn check_mask_options(opts: &ProcessOptions) -> Result<(), Error> {
+    if let Some(path) = &opts.dng_recovery_mask {
+        if !uses_dng_recovery(opts) {
+            return Err(Error::Io {
+                path: path.display().to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "mask export requires DNG recovery, ColorEncoding::None and no Cineon",
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 impl Reader {
     /// Run the full processing pipeline (white-balance, color-matrix, gamma,
     /// highlight-recovery, optional crop) and return the result as a Rust-owned
     /// 16-bit RGB image.
     pub fn get_image(&self, opts: &ProcessOptions) -> Result<Image, Error> {
+        check_mask_options(opts)?;
         let cwb = wb_cstring(opts.wb.as_deref())?;
         let sgain = self.resolve_sgain(opts.apply_sgain);
+        let recovery_y = if uses_dng_recovery(opts)
+            // SAFETY: the Reader owns a valid, loaded x3f handle.
+            && unsafe { sys::is_merrill_model(self.x3f.as_ptr()) }
+        {
+            Some(
+                crate::output::dng::recovery_luminance(self, opts.wb.as_deref())
+                    .ok_or(Error::Library(LibraryError::Argument))?,
+            )
+        } else {
+            None
+        };
+        // Replace even on OFF/non-Merrill calls. The low-level entry snapshots
+        // this before preprocessing can yield to another conversion on Rayon.
+        sys::set_dng_recovery_luminance(recovery_y);
+        sys::set_dng_recovery_mask(opts.dng_recovery_mask.clone());
         // Communicate the DNG highlight-recovery toggle to
         // `apply_highlight_clip_dng` via the thread-local FFI hook.
         // Set immediately before `x3f_get_image` so a stale value from
@@ -150,8 +185,26 @@ impl Reader {
                 cwb_ptr(&cwb),
             )
         };
+        let mask_result = sys::take_dng_recovery_mask_result();
         if ok == 0 {
             return Err(Error::Library(LibraryError::Argument));
+        }
+        if let Some(path) = &opts.dng_recovery_mask {
+            let result = mask_result.unwrap_or_else(|| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "native recovery mask was not generated",
+                ))
+            });
+            if let Err(source) = result {
+                // The image succeeded but the requested export did not. Release
+                // its allocation before returning the ordinary output error.
+                unsafe { libc::free(area.buf) };
+                return Err(Error::Io {
+                    path: path.display().to_string(),
+                    source,
+                });
+            }
         }
 
         // Capture the DNG highlight scale RIGHT NOW, before any other
@@ -276,6 +329,44 @@ unsafe fn copy_image_rows(area: &sys::x3f_area16_t) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_calibration_is_only_needed_for_the_dng_recovery_path() {
+        use crate::{ColorEncoding, DngHighlightMapping};
+        for color_encoding in [
+            ColorEncoding::None,
+            ColorEncoding::Srgb,
+            ColorEncoding::AdobeRgb,
+            ColorEncoding::ProPhotoRgb,
+            ColorEncoding::Unprocessed,
+            ColorEncoding::Qtop,
+        ] {
+            for dng_highlight_recovery in [false, true] {
+                for cineon in [false, true] {
+                    for dng_highlight_mapping in
+                        [DngHighlightMapping::Linear, DngHighlightMapping::Shoulder]
+                    {
+                        let mut opts = ProcessOptions {
+                            color_encoding,
+                            dng_highlight_recovery,
+                            cineon,
+                            dng_highlight_mapping,
+                            ..ProcessOptions::default()
+                        };
+                        assert_eq!(
+                            uses_dng_recovery(&opts),
+                            color_encoding == ColorEncoding::None
+                                && dng_highlight_recovery
+                                && !cineon
+                        );
+                        assert!(check_mask_options(&opts).is_ok());
+                        opts.dng_recovery_mask = Some("test.mask.pgm".into());
+                        assert_eq!(check_mask_options(&opts).is_ok(), uses_dng_recovery(&opts));
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn cropped_view_copies_last_row_without_reading_trailing_padding() {

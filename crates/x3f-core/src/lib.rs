@@ -146,6 +146,15 @@ pub struct ProcessOptions {
     /// without recovery, unequal channel saturation can produce a
     /// lime/yellow cast even with correct white balance and matrices.
     pub dng_highlight_recovery: bool,
+    /// Optional native sensor-stress mask destination (binary PGM). Default: none.
+    /// Requires DNG recovery and native reliability; direct `get_image` calls
+    /// must use `ColorEncoding::None` without Cineon. Creation is exclusive:
+    /// an existing destination or export failure returns an error. The mask is
+    /// active-area geometry before orientation, with 255 where any layer is
+    /// below full reliability. It is not an image-change or recovery-quality map.
+    /// A sidecar may remain after a later conversion failure; check the result,
+    /// not just its existence. No DNG/PGM two-file transaction is promised.
+    pub dng_recovery_mask: Option<std::path::PathBuf>,
     /// Mapping applied to recovered DNG highlights (default: `Linear`).
     /// Ignored unless `dng_highlight_recovery` is enabled.
     pub dng_highlight_mapping: DngHighlightMapping,
@@ -187,6 +196,7 @@ impl Default for ProcessOptions {
             denoise_intensity: 10,
             opcodes_dir: None,
             dng_highlight_recovery: false,
+            dng_recovery_mask: None,
             dng_highlight_mapping: DngHighlightMapping::default(),
             cineon: false,
         }

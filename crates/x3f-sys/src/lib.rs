@@ -187,10 +187,11 @@ pub use spatial_gain::{
 // points remain C until later phases.
 mod process;
 pub use process::{
-    x3f_get_bmt_to_xyz, x3f_get_digital_iso_gain, x3f_get_dng_highlight_scale,
-    x3f_get_dng_shoulder_ceiling, x3f_get_dng_shoulder_knee, x3f_get_gain, x3f_get_image,
-    x3f_get_preview, x3f_get_preview_with_scale, x3f_get_raw_to_xyz, x3f_set_cineon,
-    x3f_set_dng_highlight_mapping, x3f_set_dng_highlight_recovery,
+    is_merrill_model, set_dng_recovery_luminance, set_dng_recovery_mask,
+    take_dng_recovery_mask_result, x3f_get_bmt_to_xyz, x3f_get_digital_iso_gain,
+    x3f_get_dng_highlight_scale, x3f_get_dng_shoulder_ceiling, x3f_get_dng_shoulder_knee,
+    x3f_get_gain, x3f_get_image, x3f_get_preview, x3f_get_preview_with_scale, x3f_get_raw_to_xyz,
+    x3f_set_cineon, x3f_set_dng_highlight_mapping, x3f_set_dng_highlight_recovery,
 };
 
 // M6e4: highlight-recovery family (highlight_params, chroma LUT, sat

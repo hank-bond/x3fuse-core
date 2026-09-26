@@ -16,5 +16,7 @@
 # Project
 
 - [Contributor guide](./contributing.md)
+- [Accepted G1 recovery checkpoint](./recovery-g1-checkpoint.md)
+- [Native recovery exclusion sidecar](./recovery-mask.md)
 - [Releasing](./releasing.md)
 - [Port plan](./port-plan.md)

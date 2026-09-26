@@ -80,6 +80,11 @@ x3f_extract -meta input.X3F
 
 ## DNG output
 
+**Research branch:** the visually accepted, opt-in G1 tone + C2 color configuration
+is documented in [Accepted G1 recovery checkpoint](docs/src/recovery-g1-checkpoint.md).
+The ordinary CLI examples do not enable G1; this checkpoint does not install it or
+change app defaults.
+
 Foveon sensors have no demosaicing step, so DNGs are written as **Linear DNGs** (`PhotometricInterpretation = LinearRaw`). To render consistently across RAW engines (Adobe Camera Raw / Lightroom, LibRaw / RawTherapee, Capture One, and Apple's RAW engine) the writer bakes per-channel saturation into the raster and tags a uniform `BlackLevel = 0` / `WhiteLevel = 65535`, and never relies on optional hints like `BaselineExposure`.
 
 - **`-compress`**: lossless compression. TIFF uses Deflate/ZIP; DNG uses **lossless JPEG** (`Compression = 7`), the only 16-bit integer raw compression the spec allows and the one every engine decodes. Compressed output is bit-identical to uncompressed.

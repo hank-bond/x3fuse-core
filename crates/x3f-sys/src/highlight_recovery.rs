@@ -8,6 +8,9 @@ use crate::sysabi as libc;
 use std::ffi::CStr;
 use std::ptr;
 
+#[path = "donor_chroma.rs"]
+mod donor_chroma;
+
 const TILE_SIZE: usize = 16;
 const PYRAMID_LEVELS: usize = 5;
 const MIN_DONORS: f64 = 8.0;
@@ -264,6 +267,13 @@ pub struct RecoveryResult {
     pub damaged: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ColorReference {
+    pub samples: [f64; 3],
+    pub global_quality: f64,
+    pub local_weight: f64,
+}
+
 pub struct LocalRecovery {
     reliability: SensorReliability,
     levels: Vec<Level>,
@@ -397,28 +407,29 @@ impl LocalRecovery {
             })
     }
 
-    /// Camera-aware color reference, not a second repair of the source.
-    /// Reuse the native ratio estimator through the existing B/M/T tables
-    /// when exactly one layer clipped. Fade uncertain color continuously
-    /// toward a common neutral direction, without blending image texture.
-    pub fn camera_reference(
+    /// Continuous native color reference, not a second repair of the source.
+    /// Interpolate global ratios and their confidence rather than switching
+    /// between integer-bin repairs and neutral fallback. When the global
+    /// neighborhood is inconsistent, supported local color takes precedence.
+    /// Normalize directions before mixing; surviving measurements, not donor
+    /// brightness, still determine the final amplitude.
+    pub fn color_reference(
         &self,
         row: usize,
         col: usize,
         s: [f64; 3],
         prior: [f64; 3],
         lut: Option<&crate::chroma_lut_t>,
-    ) -> Option<[f64; 3]> {
-        // Diagnostic ablation: keep clipping evidence and reconstruction unchanged.
-        if !self.camera_color_reference_enabled {
+        proposal: RecoveryResult,
+    ) -> Option<ColorReference> {
+        // Preserve the camera-map diagnostic ablation without disabling the
+        // normal numeric-sensor reference through a camera-only switch.
+        if self.has_camera_maps() && !self.camera_color_reference_enabled {
             return None;
         }
 
         let hard_mask = self.mask(row, col);
-        if !self.has_camera_maps()
-            || !hard_mask.contains(&0)
-            || s.iter().any(|value| !value.is_finite())
-        {
+        if hard_mask == [255; 3] || s.iter().any(|value| !value.is_finite()) {
             return None;
         }
         if prior
@@ -462,38 +473,47 @@ impl LocalRecovery {
         if amplitude <= 0.0 || reference.iter().any(|value| !value.is_finite()) {
             return None;
         }
+        let mut result = ColorReference {
+            samples: reference,
+            global_quality: 0.0,
+            local_weight: 0.0,
+        };
+        let reference_sum = reference.iter().sum::<f64>();
+        let mix = |base: [f64; 3], color: [f64; 3], weight: f64| {
+            let sum = color.iter().sum::<f64>();
+            if !sum.is_finite() || sum <= 1e-9 || color.iter().any(|v| !v.is_finite() || *v < 0.0) {
+                return base;
+            }
+            std::array::from_fn(|c| {
+                (1.0 - weight) * base[c] + weight * color[c] / sum * reference_sum
+            })
+        };
         if self.chroma_enabled {
             if let Some(lut) = lut {
-                if let Some((color, confidence)) =
-                    self.camera_lut_reference(s, hard_mask, mask, lut)
+                if let Some((color, confidence, quality)) =
+                    self.lut_reference(s, hard_mask, mask, lut)
                 {
-                    // Normalize before mixing color so a confidence ramp
-                    // cannot itself imprint a donor-brightness gradient.
-                    let reference_sum = reference.iter().sum::<f64>();
-                    let color_sum = color.iter().sum::<f64>();
-                    if reference_sum.is_finite() && color_sum.is_finite() && color_sum > 1e-9 {
-                        let mixed = std::array::from_fn(|c| {
-                            (1.0 - confidence) * reference[c]
-                                + confidence * color[c] / color_sum * reference_sum
-                        });
-                        if mixed.iter().all(|value| value.is_finite()) {
-                            return Some(mixed);
-                        }
-                    }
+                    result.samples = mix(reference, color, confidence);
+                    result.global_quality = quality;
                 }
             }
+            if proposal.recovered && proposal.confidence.is_finite() {
+                result.local_weight =
+                    (1.0 - result.global_quality) * confidence_strength(proposal.confidence);
+                result.samples = mix(result.samples, proposal.samples, result.local_weight);
+            }
         }
-        Some(reference)
+        Some(result)
     }
 
-    fn camera_lut_reference(
+    fn lut_reference(
         &self,
         s: [f64; 3],
         hard_mask: [u8; 3],
         mask: [u8; 3],
         lut: &crate::chroma_lut_t,
-    ) -> Option<([f64; 3], f64)> {
-        let target = hard_mask.iter().position(|&value| value == 0)?;
+    ) -> Option<([f64; 3], f64, f64)> {
+        let target = (0..3).min_by_key(|&c| hard_mask[c])?;
         let (a, b, amplitude_channel, table, neutral, valid) = match target {
             0 => (1, 2, 1, &lut.lut_b, lut.neutral_bm, lut.valid_b),
             1 => (0, 2, 2, &lut.lut_m, lut.neutral_mt, lut.valid_m),
@@ -510,8 +530,10 @@ impl LocalRecovery {
         {
             return None;
         }
-        let position =
-            (s[a] / (s[a] + s[b]) * (table.len() - 1) as f64).clamp(0.0, (table.len() - 1) as f64);
+        // Tables were accumulated with floor binning. Their observations
+        // belong at bin centers, not at the left edges.
+        let position = (s[a] / (s[a] + s[b]) * (table.len() - 1) as f64 - 0.5)
+            .clamp(0.0, (table.len() - 1) as f64);
         let lo = position.floor() as usize;
         let hi = (lo + 1).min(table.len() - 1);
         let left = table[lo] as f64;
@@ -559,14 +581,38 @@ impl LocalRecovery {
             let floor = signal_floor(self.reliability.noise[channel]);
             anchor_confidence *= trust * trust * camera_smoothstep((s[channel] - floor) / floor);
         }
-        let confidence =
-            anchor_confidence * variation_confidence * neutral_confidence * bound_confidence;
-        if !confidence.is_finite() || confidence <= 0.0 {
+        // Near-neutral is not absent evidence. Keep quality separate from
+        // chroma strength so a coherent neutral estimate can still prevent
+        // unrelated local donors from coloring a neutral subject.
+        let quality = (anchor_confidence * variation_confidence * bound_confidence).clamp(0.0, 1.0);
+        let confidence = quality * neutral_confidence;
+        if !quality.is_finite() {
             return None;
         }
         let mut reference = s;
         reference[target] = predicted;
-        Some((reference, confidence.clamp(0.0, 1.0)))
+        Some((reference, confidence, quality))
+    }
+
+    /// Research-only chromaticity evidence, not reconstructed layer values.
+    /// Donor admission is unchanged, including the deferred repair/mask issue.
+    pub fn colorization_direction(
+        &self,
+        row: usize,
+        col: usize,
+        s: [f64; 3],
+        radius: usize,
+    ) -> Option<([f64; 3], f64)> {
+        if row >= self.reliability.rows || col >= self.reliability.cols {
+            return None;
+        }
+        donor_chroma::Settings::colorization(radius).estimate(
+            &self.levels[0],
+            [row as f64, col as f64],
+            s,
+            self.mask(row, col),
+            self.reliability.noise,
+        )
     }
 
     pub fn recover(&self, row: usize, col: usize, s: [f64; 3], prior: [f64; 3]) -> RecoveryResult {
@@ -960,8 +1006,10 @@ fn guard_rgb(matrix: &[f64; 9], samples: [f64; 3]) -> [f64; 3] {
     })
 }
 
-/// Keep legacy highlight hue unless the local estimate agrees in rendered
-/// chromaticity, then recover brightness from the measured surviving layers.
+/// Fade from measured color to the stabilized reconstruction as sensor
+/// reliability declines. Negative display RGB alone is not damage evidence.
+/// Where recovery is supported, keep legacy hue unless the local estimate
+/// agrees in rendered chromaticity, and recover brightness from survivors.
 /// All vectors are after spatial gain. The returned vector is coherent:
 /// componentwise restoration or clipping floors must not follow this step.
 pub fn stabilize_highlight_color(
@@ -977,40 +1025,41 @@ pub fn stabilize_highlight_color(
     {
         return stable;
     }
-    let original_rgb = guard_rgb(matrix, original);
-    let healthy = mask == [255; 3];
-    if healthy && original_rgb.iter().all(|v| v.is_finite() && *v >= 0.0) {
+    if mask == [255; 3] {
         return original;
     }
+    // Use the same smooth confidence ramp as the negative-color guard.
+    // Its zero derivative at the healthy endpoint suppresses the first
+    // quantized reliability step, instead of snapping to legacy color.
+    // Once a layer is substantially stressed (reliability <= 127), retain
+    // the established correction exactly, including clipped-neutral repair.
+    let strength = confidence_strength(1.0 - mask.into_iter().min().unwrap_or(255) as f64 / 255.0);
+    let blend = |target: [f64; 3]| {
+        if strength == 1.0 {
+            target
+        } else {
+            std::array::from_fn(|c| (1.0 - strength) * original[c] + strength * target[c])
+        }
+    };
     let stable_rgb = guard_rgb(matrix, stable);
     let Some(stable_chroma) = rgb_chromaticity(stable_rgb) else {
         // The caller can apply the negative-RGB guard with its calibrated
         // neutral direction when the legacy color itself is not usable.
-        return stable;
+        return blend(stable);
     };
     let stable_sum = stable_rgb.iter().sum::<f64>();
     let smooth = |t: f64| {
         let t = t.clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
     };
-    let original_max = original.into_iter().fold(0.0_f64, f64::max);
-    if healthy && original_max <= 0.75 {
-        return stable;
-    }
     let weights: [f64; 3] = std::array::from_fn(|c| {
-        let mut reliability = mask[c] as f64 / 255.0;
-        if healthy {
-            // A pathological matrix response can precede the metadata
-            // clipping threshold. Downweight bright source layers smoothly
-            // instead of choosing a discontinuous maximum-channel index.
-            reliability *= 1.0 - smooth((original[c] - 0.75) / 0.25);
-        }
+        let reliability = mask[c] as f64 / 255.0;
         let signal = smooth((original[c] - 0.002) / 0.018);
         reliability * reliability * signal
     });
     let source_weight = weights.iter().sum::<f64>();
     if source_weight <= 0.0 {
-        return stable;
+        return blend(stable);
     }
     let source_support = confidence_strength(source_weight);
     let candidate_rgb = guard_rgb(matrix, candidate);
@@ -1040,16 +1089,16 @@ pub fn stabilize_highlight_color(
         }
     }
     if amplitude_weight <= 0.0 {
-        return stable;
+        return blend(stable);
     }
     let measured_amplitude = weighted_amplitude / amplitude_weight;
     let trust = confidence_strength(amplitude_weight);
     let amplitude = (1.0 - trust) * stable_sum + trust * measured_amplitude;
     let result = direction.map(|v| v * amplitude);
     if result.iter().all(|v| v.is_finite()) {
-        result
+        blend(result)
     } else {
-        stable
+        blend(stable)
     }
 }
 
@@ -1192,14 +1241,108 @@ mod tests {
     }
 
     #[test]
-    fn stabilization_uses_stable_hue_for_bright_pathological_healthy_masks() {
+    fn stabilization_preserves_healthy_negative_rgb_at_every_brightness() {
+        // An intentionally changed expectation: the old test asserted that
+        // a negative matrix response justified neutralizing a healthy mask.
+        for scale in [0.01, 0.3, 1.0, 2.0] {
+            let original = [0.3, 0.84, 0.99].map(|v| v * scale);
+            assert!(guard_rgb(&CANCELLATION_MATRIX, original)[2] < 0.0);
+            assert_eq!(
+                stabilize_highlight_color(
+                    original,
+                    [0.6; 3],
+                    original,
+                    [255; 3],
+                    &CANCELLATION_MATRIX
+                ),
+                original,
+            );
+        }
+    }
+
+    #[test]
+    fn stabilization_shoulder_is_bounded_for_each_channel_and_quantized_step() {
         let original = [0.3, 0.84, 0.99];
-        let result =
-            stabilize_highlight_color(original, [0.6; 3], original, [255; 3], &CANCELLATION_MATRIX);
-        let rgb = guard_rgb(&CANCELLATION_MATRIX, result);
-        assert!(rgb.iter().all(|v| *v > 0.0));
-        assert!((rgb[0] - rgb[1]).abs() < 1e-12);
-        assert!((rgb[1] - rgb[2]).abs() < 1e-12);
+        for channel in 0..3 {
+            let mut previous = original;
+            for code in (0..=255_u8).rev() {
+                let mut mask = [255; 3];
+                mask[channel] = code;
+                let result = stabilize_highlight_color(
+                    original,
+                    [0.6; 3],
+                    original,
+                    mask,
+                    &CANCELLATION_MATRIX,
+                );
+                for c in 0..3 {
+                    assert!(result[c].is_finite());
+                    assert!(
+                        (result[c] - previous[c]).abs() < 0.012,
+                        "channel {channel}, code {code}"
+                    );
+                    if code == 254 {
+                        assert!((result[c] - original[c]).abs() < 0.0002);
+                    }
+                }
+                previous = result;
+            }
+        }
+    }
+
+    #[test]
+    fn stabilization_fades_negative_legacy_fallback_too() {
+        let original = [0.4; 3];
+        let stable = [0.3, 0.84, 0.99];
+        let result = stabilize_highlight_color(
+            original,
+            stable,
+            original,
+            [255, 254, 255],
+            &CANCELLATION_MATRIX,
+        );
+        for c in 0..3 {
+            assert!((result[c] - original[c]).abs() < 0.0002);
+        }
+        assert_eq!(
+            stabilize_highlight_color(
+                original,
+                stable,
+                original,
+                [0, 255, 255],
+                &CANCELLATION_MATRIX
+            ),
+            stable
+        );
+    }
+
+    #[test]
+    fn stabilized_guard_retains_clipped_neutral_repair_and_survivor_continuity() {
+        let original = [0.3, 0.84, 0.99];
+        let mut previous: Option<[f64; 3]> = None;
+        for shift in -64_i16..=64 {
+            let mask = [(128 + shift) as u8, (128 - shift) as u8, 0];
+            let stable = protect_highlight_color(
+                original,
+                original,
+                mask,
+                [1.0; 3],
+                &CANCELLATION_MATRIX,
+                0.20,
+                0.30,
+            );
+            let result =
+                stabilize_highlight_color(original, stable, original, mask, &CANCELLATION_MATRIX);
+            let rgb = guard_rgb(&CANCELLATION_MATRIX, result);
+            assert!((rgb[0] - rgb[1]).abs() < 1e-12);
+            assert!((rgb[1] - rgb[2]).abs() < 1e-12);
+            if let Some(previous) = previous {
+                for c in 0..3 {
+                    assert!((result[c] - previous[c]).abs() < 0.012);
+                }
+            }
+            previous = Some(result);
+        }
     }
 
     #[test]
