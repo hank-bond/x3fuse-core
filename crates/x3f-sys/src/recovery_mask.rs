@@ -1,6 +1,7 @@
-//! Read-only native sensor-stress sidecar for training exclusions.
-//! PGM: 255 excludes any partially/unreliable layer; 0 is fully healthy.
-//! This is not a G1-minus-T1 change mask or a claim of recoverable detail.
+//! Write a separate Portable Graymap (PGM) mask of unreliable source measurements.
+//! A value of 255 marks pixels with any layer below full reliability.
+//! Zero means all layers are fully reliable. Neither value describes changes
+//! to the output image or how much detail can be recovered.
 use super::{DngCtx, LocalRecovery};
 use std::cell::RefCell;
 use std::fs::OpenOptions;
@@ -12,19 +13,19 @@ thread_local! {
     static RESULT: RefCell<Option<io::Result<()>>> = const { RefCell::new(None) };
 }
 
-/// Rust-only per-conversion request; never read a process-wide output filename.
+/// Set or clear the mask path for this conversion and discard the previous result.
 pub fn set_output(path: Option<PathBuf>) {
     OUTPUT.with(|slot| *slot.borrow_mut() = path);
     RESULT.with(|slot| *slot.borrow_mut() = None);
 }
 
-/// Take immediately after x3f_get_image, like its headroom result.
+/// Read and clear the export result immediately after the `x3f_get_image` call returns.
 pub fn take_result() -> Option<io::Result<()>> {
     RESULT.with(|slot| slot.borrow_mut().take())
 }
 
-/// Keep request/result local across nested Rayon work. Publish on every exit from
-/// x3f_get_image, including early returns, without changing its legacy C signature.
+/// Own the request and result while conversion runs, including parallel work.
+/// The `Drop` implementation publishes the result when the `x3f_get_image` call exits.
 pub(super) struct Export {
     path: Option<PathBuf>,
     result: Option<io::Result<()>>,

@@ -2587,9 +2587,9 @@ struct DngCtx<'a> {
 unsafe impl Send for DngCtx<'_> {}
 unsafe impl Sync for DngCtx<'_> {}
 
-/// Both encoding passes evaluate the same original pixel against the same
-/// frozen model. No neighboring raster access, environment reads, or model
-/// updates are allowed here, so the second pass can write rows in place.
+/// Both passes evaluate each source pixel using the same read-only model.
+/// Do not read neighboring pixels, read environment settings, or update the model
+/// here. The encoding pass overwrites source pixels as it proceeds.
 #[inline]
 unsafe fn dng_evaluate_pixel(
     ctx: &DngCtx<'_>,
@@ -2615,9 +2615,8 @@ unsafe fn dng_evaluate_pixel(
             ctx.cols,
         )
     });
-    // x3f_get_image admits this calibration only for the Merrill family.
-    // Other sensors keep the upstream reconstruction below, not Merrill's
-    // healthy-color or co-sited-layer assumptions.
+    // x3f_get_image supplies these coefficients only for Merrill cameras.
+    // Other sensors use the reconstruction below this branch.
     if let Some(camera_y) = ctx.camera_y.filter(|_| ctx.recovery) {
         const COLOR_RADIUS: usize = 256;
         let model = local.expect("tone anchor requires native reliability");
@@ -4148,8 +4147,7 @@ mod tests {
             // Same healthy mask as the Merrill witness, but the author's older
             // path retains its safeguard for this pathological matrix response.
             assert_ne!(result, measured);
-            // Exact replay of this synthetic fixture through the upstream
-            // evaluator and native model (before the Merrill contribution).
+            // Exact expected result for this synthetic older-sensor fixture.
             assert_eq!(
                 result,
                 [0.4730096544303833, 0.4836258312131101, 0.486574769208312]

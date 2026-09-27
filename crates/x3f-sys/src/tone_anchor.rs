@@ -1,5 +1,7 @@
-//! Per-pixel tone anchor for gradient tone reconstruction. No donor color is used.
-//! Survivor/envelope estimates are brightness assumptions, not physical luminance.
+//! Estimate a starting brightness for each affected Merrill pixel.
+//! Use camera luminance where possible and layer-based estimates for severe clipping.
+//! Nearby pixels supply no color at this stage. Missing brightness is estimated,
+//! not measured.
 
 pub(super) struct Result {
     pub samples: [f64; 3],
@@ -24,7 +26,7 @@ pub(super) fn recover(measured: [f64; 3], mask: [u8; 3], neutral: [f64; 3]) -> R
     let weights = mask.map(|v| (v as f64 / 255.0).powi(2));
     let support: f64 = weights.iter().sum();
     if support == 0.0 {
-        // No measured anchor: do not manufacture texture or borrow R1 color.
+        // No reliable layer remains. This estimate cannot supply texture or color.
         return result;
     }
     let amplitude = (0..3)
@@ -34,8 +36,8 @@ pub(super) fn recover(measured: [f64; 3], mask: [u8; 3], neutral: [f64; 3]) -> R
     if !amplitude.is_finite() || amplitude < 0.0 {
         return result;
     }
-    // Same damage-onset shape as the current native stabilizer. No chroma
-    // confidence, neighborhood support, clipped maximum, or matrix-RGB gate.
+    // Recovery strength rises smoothly as the lowest layer reliability falls.
+    // Nearby color and the rendered RGB values do not set this strength.
     let damage = 1.0 - mask.into_iter().min().unwrap_or(255) as f64 / 255.0;
     let t = (2.0 * damage).clamp(0.0, 1.0);
     let strength = t * t * (3.0 - 2.0 * t);
@@ -88,8 +90,8 @@ fn recover_luminance(measured: [f64; 3], mask: [u8; 3], neutral: [f64; 3], y: [f
     result
 }
 
-// The severe-clipping envelope is a neutral-ray assumption, NOT a
-// physical luminance bound for arbitrary colored material or recovered texture.
+// Severe clipping uses the neutral layer ratios to estimate brightness.
+// That estimate is not a physical brightness bound for colored material.
 pub(super) fn recover_severe(
     measured: [f64; 3],
     mask: [u8; 3],
@@ -132,8 +134,8 @@ pub(super) fn recover_severe(
     if !amplitude.is_finite() || amplitude <= 0.0 {
         return hold;
     }
-    // Two layers below half reliability implies the existing damage onset is
-    // already exactly one. Include zero-support pixels for a continuous limit.
+    // With two layers below half reliability, recovery strength is exactly one.
+    // Include fully clipped pixels so the estimate remains continuous.
     Result {
         samples: neutral.map(|v| amplitude * v),
         amplitude,

@@ -75,9 +75,8 @@ impl ColorCalibration {
             .map(|v| ((v * 10_000.0).round().max(1.0) as u32, 10_000))
     }
 
-    /// Camera-space Y in the same coordinates as the emitted DNG calibration.
-    /// Use its rounded tags, not the higher-precision intermediate matrices:
-    /// recovery was calibrated against these published values.
+    /// Coefficients for calculating brightness from sensor-layer samples.
+    /// Use rounded tag values so recovery and DNG readers share the calibration.
     pub(super) fn recovery_luminance(&self, forward: [f32; 9]) -> Option<[f64; 3]> {
         if forward.iter().any(|v| !v.is_finite()) {
             return None;

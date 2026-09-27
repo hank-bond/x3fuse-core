@@ -1,8 +1,9 @@
-//! Gradient tone reconstruction, anchored to the per-pixel tone estimate.
-//! Source processing and subsequent highlight color reconstruction are unchanged.
-//! Solve at native resolution before both evaluator passes; never read neighbors
-//! during in-place encoding. Log space is only used for positive tonal targets
-//! and positive individual layers, not for signed measured camera luminance.
+//! Reconstruct Merrill brightness from differences between neighboring pixels
+//! within each sensor layer.
+//! Keep each pixel's tone estimate as a weak constraint. Build the field at native
+//! resolution before measuring headroom or encoding pixels, so both passes read
+//! the same data. Encoding must not read neighbors it may have overwritten.
+//! Take logarithms only of positive targets and positive layer measurements.
 use super::{tone_anchor, DngCtx, LocalRecovery};
 use crate::x3f_calc_spatial_gain;
 
@@ -30,8 +31,8 @@ struct Row {
     weights: [f64; 4],
 }
 
-// Gradient numerator and absolute evidence weight. Tiny support cannot acquire
-// full authority through relative normalization; no evidence means no constraint.
+// Return the weighted layer differences and their total weight.
+// Keep small reliability weights small. Zero weight adds no neighbor constraint.
 fn edge(a: Source, b: Source) -> (f64, f64) {
     let mut weight = 0.0;
     let mut gradient = 0.0;
@@ -89,7 +90,7 @@ fn solve(rows: &[Row], rhs: &[f64], x: &mut [f64]) -> Result<(usize, f64), &'sta
     let mut rz = dot(&residual, &z);
     for iteration in 0..=1000 {
         if norm(&residual) <= tolerance {
-            // Check the actual normal-equation residual, not only CG's recurrence.
+            // Recompute the equation error instead of relying on the running estimate.
             multiply(rows, x, &mut ax);
             let actual = rhs
                 .iter()

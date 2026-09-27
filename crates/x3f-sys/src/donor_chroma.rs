@@ -1,9 +1,9 @@
-//! Guided donor chromaticity for highlight color reconstruction.
+//! Estimate highlight color ratios from nearby reliable pixels, called donors.
 //!
-//! A fixed compact kernel over immutable finest-grid donor moments removes
-//! first-sufficient pyramid selection and nonzero-weight tile entry/exit.
-//! Guidance tests surviving-layer ratio compatibility, not material identity.
-//! Downstream reconstruction/reference decisions are deliberately unchanged.
+//! Read donor counts, color sums, and squared sums from the smallest grid tiles.
+//! Weights fade to zero at the radius boundary. Available source layers reduce
+//! the weight of donors with conflicting ratios. Matching ratios do not prove
+//! that a donor belongs to the same material.
 
 use super::{
     camera_smoothstep, signal_floor, Level, MAX_AMPLITUDE_DISAGREEMENT, MAX_VARIATION, MIN_DONORS,
@@ -85,15 +85,16 @@ impl Settings {
             let variance = (squares[channel] / support - chroma[channel].powi(2)).max(0.0);
             variation = variation.max(variance.sqrt() / chroma[channel]);
         }
-        // Keep within-tile variance, not just variance of tile means. A
-        // mixture must not become more certain merely by being aggregated.
+        // Include color differences within each tile, not just between tile means.
+        // Averaging mixed colors must not make them look more consistent.
         let coherence = camera_smoothstep(1.0 - variation / MAX_VARIATION);
         let confidence = camera_smoothstep(support / MIN_DONORS) * coherence;
         Some((chroma, confidence))
     }
 }
 
-/// q is squared normalized distance; value AND slope vanish at q=1.
+/// The `q` parameter is squared distance divided by squared radius.
+/// The function value and slope are zero at `q = 1`.
 fn compact(q: f64) -> f64 {
     (1.0 - q).clamp(0.0, 1.0).powi(2)
 }

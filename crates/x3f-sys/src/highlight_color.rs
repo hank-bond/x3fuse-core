@@ -1,5 +1,5 @@
-//! Highlight color reconstruction on an established scalar-tone target.
-//! No tone filtering, reference CLUT, gamut snap or extra onset ramp.
+//! Add nearby color ratios without changing the chosen highlight brightness.
+//! Without usable color evidence, keep the tone result.
 
 use super::tone_anchor;
 
@@ -34,8 +34,8 @@ pub(super) fn apply(
         return tone.samples;
     }
     let weight = confidence.clamp(0.0, 1.0);
-    // Color the target, then use the ORIGINAL single tone-onset blend. Mixing
-    // an already-onset-blended image with donor color would apply onset twice.
+    // Color the target before blending it with the measured pixel.
+    // Blending donor color into the `tone.samples` field would apply recovery strength twice.
     std::array::from_fn(|c| {
         let target = target[c] + weight * (colored[c] - target[c]);
         if tone.strength == 1.0 {
