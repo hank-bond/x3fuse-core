@@ -139,9 +139,20 @@ pixels are called *donors*. The search uses a fixed 256-pixel radius and reduces
 the weight of donors whose ratios disagree with the available layer measurements.
 A mix of inconsistent donor colors also lowers confidence.
 
+When bad-pixel correction is enabled, camera-marked repair sites are excluded
+from Merrill color donors. Their interpolated values are replacements, not
+independent reliable measurements. This repair provenance is tracked separately
+from layer clipping reliability: it does not change tone reconstruction, repair
+itself, or the exported source-reliability mask. Recovery-off, older-sensor and
+Quattro processing retain their existing behavior.
+
 The color stage scales the selected ratios to the reconstructed brightness.
 Without usable donor color, it keeps the tone result. Recovery strength increases
 smoothly as layer reliability falls. This blend is applied once, not once per stage.
+Large clipped regions can lack valid donors within the search radius. They may
+become neutral, with visible color transitions at the boundary of donor support.
+Excluding contaminated donors prevents false color but does not solve that
+remaining limitation.
 
 ## Rust API
 

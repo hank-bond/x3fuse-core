@@ -282,7 +282,7 @@ impl Field {
         // Use the existing verbosity gate and embedding callback, not stderr.
         unsafe {
             crate::x3f_printf(crate::x3f_verbosity_t_DEBUG,
-                c"GRADIENT_TONE_FROZEN nodes=%zu unsupported=%zu anchor=%.17f iterations=%zu residual=%.17e rhs_norm=%.17e elapsed_s=%.3f\n".as_ptr(),
+                c"DNG_RECOVERY_GRADIENT nodes=%zu unsupported=%zu anchor=%.17f iterations=%zu residual=%.17e rhs_norm=%.17e elapsed_s=%.3f\n".as_ptr(),
                 sources.len(), no_support, ANCHOR, iterations, residual,
                 norm(&rhs), start.elapsed().as_secs_f64());
         }

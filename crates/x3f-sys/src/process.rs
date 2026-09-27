@@ -728,7 +728,7 @@ pub unsafe extern "C" fn interpolate_bad_pixels(
     image: *mut x3f_area16_t,
     colors: libc::c_int,
 ) {
-    unsafe { interpolate_bad_pixels_controlled(x3f, image, colors, Control::none()) }
+    unsafe { interpolate_bad_pixels_controlled(x3f, image, colors, Control::none(), None) }
 }
 
 unsafe fn interpolate_bad_pixels_controlled(
@@ -736,6 +736,7 @@ unsafe fn interpolate_bad_pixels_controlled(
     image: *mut x3f_area16_t,
     colors: libc::c_int,
     control: Control<'_>,
+    repair_marked: Option<&mut [bool]>,
 ) {
     let img = unsafe { &*image };
     let cs = img.columns as i32;
@@ -1019,6 +1020,15 @@ unsafe fn interpolate_bad_pixels_controlled(
     }
 
     // ---- END — collecting; BEGIN — fixing ----
+
+    // Keep repair provenance after the interpolation loop consumes this list.
+    // Even an unresolved repair site cannot supply independent donor evidence.
+    if let Some(marked) = repair_marked {
+        assert_eq!(marked.len(), cs as usize * rs as usize);
+        for pixel in &bad_pixels {
+            marked[pixel.r as usize * cs as usize + pixel.c as usize] = true;
+        }
+    }
 
     if !bad_pixels.is_empty() {
         unsafe {
@@ -1399,7 +1409,7 @@ pub unsafe extern "C" fn preprocess_data(
     wb: *mut libc::c_char,
     ilevels: *mut x3f_image_levels_t,
 ) -> libc::c_int {
-    unsafe { preprocess_data_impl(x3f, fix_bad, wb, ilevels, None, Control::none()) }
+    unsafe { preprocess_data_impl(x3f, fix_bad, wb, ilevels, None, false, Control::none()) }
 }
 
 // Provenance belongs to one conversion, never to the C image layout or a
@@ -1410,6 +1420,7 @@ unsafe fn preprocess_data_impl(
     wb: *mut libc::c_char,
     ilevels: *mut x3f_image_levels_t,
     provenance: Option<&mut Option<SensorReliability>>,
+    track_repaired_donors: bool,
     control: Control<'_>,
 ) -> libc::c_int {
     if control.check().is_err() {
@@ -1690,7 +1701,7 @@ unsafe fn preprocess_data_impl(
             }
         });
         if fix_bad != 0 {
-            unsafe { interpolate_bad_pixels_controlled(x3f, &mut qtop, 1, control) };
+            unsafe { interpolate_bad_pixels_controlled(x3f, &mut qtop, 1, control, None) };
         }
     }
 
@@ -1723,7 +1734,11 @@ unsafe fn preprocess_data_impl(
     }
 
     if fix_bad != 0 {
-        unsafe { interpolate_bad_pixels_controlled(x3f, &mut image, 3, control) };
+        let repair_marked = reliability
+            .as_mut()
+            .filter(|_| track_repaired_donors)
+            .map(|mask| mask.repair_marked.as_mut_slice());
+        unsafe { interpolate_bad_pixels_controlled(x3f, &mut image, 3, control, repair_marked) };
     }
 
     if let Some(output) = provenance {
@@ -3439,16 +3454,13 @@ unsafe fn apply_highlight_clip_dng_impl(
                 .reduce(|| 1.0, f64::max)
         };
         if ctx.camera_y.is_some() {
-            const HEADROOM_FLOOR: f64 = 1.0;
             unsafe {
                 x3f_printf(
                     x3f_verbosity_t_DEBUG,
-                    c"SURVIVOR_TONE_HEADROOM measured=%.17f floor=%.17f\n".as_ptr(),
+                    c"DNG_RECOVERY_HEADROOM maximum=%.17f\n".as_ptr(),
                     maximum,
-                    HEADROOM_FLOOR,
                 );
             }
-            maximum = maximum.max(HEADROOM_FLOOR);
         }
         maximum = maximum.clamp(1.0, DNG_MAX_HEADROOM);
         data.par_chunks_mut(stride)
@@ -3556,6 +3568,9 @@ fn crop_reliability_view(
     for r in 0..rows {
         cropped.data[r * cols..(r + 1) * cols].copy_from_slice(
             &mask.data[(row + r) * mask.cols + col..(row + r) * mask.cols + col + cols],
+        );
+        cropped.repair_marked[r * cols..(r + 1) * cols].copy_from_slice(
+            &mask.repair_marked[(row + r) * mask.cols + col..(row + r) * mask.cols + col + cols],
         );
     }
     Some(cropped)
@@ -3872,6 +3887,7 @@ unsafe fn get_image_impl(
             wb,
             &mut il,
             if capture { Some(&mut provenance) } else { None },
+            recovery_y.is_some(),
             control,
         )
     } == 0
@@ -4339,6 +4355,107 @@ mod tests {
     }
 
     #[test]
+    fn repair_provenance_follows_cropped_and_full_sensor_views() {
+        use super::*;
+        let mut pixels = [0u16; 4 * 5 * 3];
+        let source = x3f_area16_t {
+            data: pixels.as_mut_ptr(),
+            buf: ptr::null_mut(),
+            rows: 4,
+            columns: 5,
+            channels: 3,
+            row_stride: 15,
+        };
+        let cropped_view = x3f_area16_t {
+            data: unsafe { pixels.as_mut_ptr().add(18) },
+            buf: ptr::null_mut(),
+            rows: 2,
+            columns: 3,
+            channels: 3,
+            row_stride: 15,
+        };
+        let make_mask = || {
+            let mut mask = SensorReliability::new(4, 5, [0.001; 3]).unwrap();
+            mask.repair_marked[0] = true;
+            mask.repair_marked[7] = true;
+            mask.data[8] = [255, 100, 0];
+            mask.camera_map_channels = 4;
+            mask
+        };
+        let cropped = crop_reliability(make_mask(), &source, &cropped_view).unwrap();
+        assert_eq!(
+            cropped.repair_marked,
+            [false, true, false, false, false, false]
+        );
+        assert_eq!(
+            cropped.data,
+            [
+                [255; 3],
+                [255; 3],
+                [255, 100, 0],
+                [255; 3],
+                [255; 3],
+                [255; 3]
+            ]
+        );
+        assert_eq!(cropped.camera_map_channels, 4);
+        assert_eq!(cropped.noise, [0.001; 3]);
+        let full = crop_reliability(make_mask(), &source, &source).unwrap();
+        let expected = make_mask();
+        assert_eq!(full.repair_marked, expected.repair_marked);
+        assert_eq!(full.data, expected.data);
+        assert_eq!(full.camera_map_channels, 4);
+    }
+
+    #[test]
+    fn excluding_repaired_donors_does_not_change_gradient_tone() {
+        use super::*;
+        let prior = [1.0; 3];
+        let mut ctx = recovery_test_context(&prior);
+        ctx.rows = 3;
+        ctx.cols = 3;
+        let make_model = |exclude: bool| {
+            let mut mask = SensorReliability::new(3, 3, [0.001; 3]).unwrap();
+            mask.data.fill([255, 255, 0]);
+            mask.data[0] = [255; 3];
+            mask.repair_marked.fill(exclude);
+            LocalRecovery::build(mask, |_, _| [0.2; 3], None).unwrap()
+        };
+        let before = make_model(false);
+        let after = make_model(true);
+        let data: Vec<u16> = (0..9).flat_map(|i| [2000 + i * 100; 3]).collect();
+        let first =
+            unsafe { gradient_tone::Field::build(&ctx, Some(&before), &data, 9, Control::none()) }
+                .unwrap();
+        let second =
+            unsafe { gradient_tone::Field::build(&ctx, Some(&after), &data, 9, Control::none()) }
+                .unwrap();
+        for r in 0..3 {
+            for c in 0..3 {
+                let measured = [data[(r * 3 + c) * 3] as f64 / 10000.0; 3];
+                let mut a = tone_anchor::recover_severe(
+                    measured,
+                    before.mask(r, c),
+                    prior,
+                    ctx.camera_y.unwrap(),
+                );
+                let mut b = tone_anchor::recover_severe(
+                    measured,
+                    after.mask(r, c),
+                    prior,
+                    ctx.camera_y.unwrap(),
+                );
+                first.apply(r, c, &mut a, measured, prior);
+                second.apply(r, c, &mut b, measured, prior);
+                assert_eq!(a.samples, b.samples);
+                assert_eq!(a.amplitude, b.amplitude);
+                assert_eq!(a.strength, b.strength);
+                assert_eq!(a.available, b.available);
+            }
+        }
+    }
+
+    #[test]
     fn gradient_build_reports_missing_evidence_and_invalid_luminance() {
         use super::*;
         let prior = [1.0; 3];
@@ -4491,8 +4608,8 @@ mod tests {
                 assert_eq!(messages[0].0, x3f_verbosity_t_DEBUG);
                 assert!(messages[0]
                     .1
-                    .starts_with("GRADIENT_TONE_FROZEN nodes=0 unsupported=0 "));
-                assert_eq!(messages[1], (x3f_verbosity_t_DEBUG, "RECOVERY_MASK_FROZEN bounds=[0, 0, 1, 1] excluded=0 policy=any_layer_below_255\n".to_owned()));
+                    .starts_with("DNG_RECOVERY_GRADIENT nodes=0 unsupported=0 "));
+                assert_eq!(messages[1], (x3f_verbosity_t_DEBUG, "DNG_RECOVERY_MASK bounds=[0, 0, 1, 1] excluded=0 policy=any_layer_below_255\n".to_owned()));
             } else {
                 assert_eq!(messages.len(), 1);
             }
@@ -4723,6 +4840,7 @@ mod tests {
         use crate::*;
 
         let render = |mut pattern: [u32; 4]| {
+            let mut marked = [false; 9];
             let mut pixels = [10u16; 3 * 3 * 3];
             pixels[12..15].fill(1000);
             unsafe {
@@ -4752,8 +4870,25 @@ mod tests {
                     channels: 3,
                     row_stride: 9,
                 };
+                super::interpolate_bad_pixels_controlled(
+                    &mut x3f,
+                    &mut image,
+                    3,
+                    crate::Control::none(),
+                    Some(&mut marked),
+                );
+                let recorded = pixels;
+                pixels.fill(10);
+                pixels[12..15].fill(1000);
                 super::interpolate_bad_pixels(&mut x3f, &mut image, 3);
+                assert_eq!(
+                    pixels, recorded,
+                    "recording provenance must not change repair"
+                );
             }
+            let mut expected_marked = [false; 9];
+            expected_marked[4] = pixels[12] == 10;
+            assert_eq!(marked, expected_marked);
             pixels
         };
 

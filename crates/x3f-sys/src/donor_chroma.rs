@@ -154,6 +154,55 @@ mod tests {
     }
 
     #[test]
+    fn repaired_pixels_cannot_supply_color_but_keep_source_reliability() {
+        let mut reliability = SensorReliability::new(16, 16, [0.001; 3]).unwrap();
+        reliability.data[8 * 16 + 8] = [255, 255, 0];
+        reliability.repair_marked.fill(true);
+        let masks = reliability.data.clone();
+        let model = LocalRecovery::build(reliability, |_, _| [0.2, 0.3, 0.5], None).unwrap();
+        for row in 0..16 {
+            for col in 0..16 {
+                assert_eq!(model.mask(row, col), masks[row * 16 + col]);
+            }
+        }
+        assert!(model
+            .colorization_direction(8, 8, [0.2, 0.3, 0.8], 256)
+            .is_none());
+    }
+
+    #[test]
+    fn repaired_color_is_excluded_without_discarding_real_donors() {
+        let good = [0.2, 0.3, 0.5];
+        let mut reliability = SensorReliability::new(16, 16, [0.001; 3]).unwrap();
+        for row in 0..16 {
+            for col in 8..16 {
+                reliability.repair_marked[row * 16 + col] = true;
+            }
+        }
+        reliability.data[8 * 16 + 8] = [255, 0, 0];
+        let model = LocalRecovery::build(
+            reliability,
+            |_, col| if col < 8 { good } else { [0.4, 0.2, 0.4] },
+            None,
+        )
+        .unwrap();
+        let (chroma, confidence) = model
+            .colorization_direction(8, 8, [0.2, 0.8, 0.9], 256)
+            .unwrap();
+        for c in 0..3 {
+            assert!((chroma[c] - good[c]).abs() < 1e-12);
+        }
+        assert!(confidence > 0.99);
+    }
+
+    #[test]
+    fn mismatched_repair_provenance_is_rejected() {
+        let mut reliability = SensorReliability::new(1, 2, [0.001; 3]).unwrap();
+        reliability.repair_marked.pop();
+        assert!(LocalRecovery::build(reliability, |_, _| [0.2; 3], None).is_none());
+    }
+
+    #[test]
     fn constant_color_is_preserved() {
         let p = [0.2, 0.3, 0.5];
         let level = level(&[(64, 64, p, 32), (64, 96, p, 16)]);

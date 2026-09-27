@@ -42,7 +42,7 @@ pub(super) fn write(
     let excluded = write_file(path, bounds, |r, c| model.mask(r, c), control)?;
     unsafe {
         crate::x3f_printf(crate::x3f_verbosity_t_DEBUG,
-            c"RECOVERY_MASK_FROZEN bounds=[%zu, %zu, %zu, %zu] excluded=%zu policy=any_layer_below_255\n".as_ptr(),
+            c"DNG_RECOVERY_MASK bounds=[%zu, %zu, %zu, %zu] excluded=%zu policy=any_layer_below_255\n".as_ptr(),
             bounds[0], bounds[1], bounds[2], bounds[3], excluded);
     }
     Ok(())
