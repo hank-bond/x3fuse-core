@@ -108,9 +108,9 @@ Submodules:
   `max_printed_matrix_elements`) in safe setters, plus
   `set_log_callback` for mobile/WASM logging.
 - [`image.rs`](../../crates/x3f-core/src/image.rs) — `Image` struct
-  that snapshots `DNG_HIGHLIGHT_SCALE` immediately after
-  `x3f_get_image` returns (M5e fix for batch determinism). The wrapper
-  also collects the recovery-mask export result for that conversion.
+  that receives encoding metadata from `get_image_controlled` through
+  per-conversion `ProcessingInfo`. The wrapper also checks that
+  conversion's recovery-mask export result.
 
 ## `crates/x3f-cli`
 

@@ -5,7 +5,7 @@
 //! the same data. Encoding must not read neighbors it may have overwritten.
 //! Take logarithms only of positive targets and positive layer measurements.
 use super::{tone_anchor, DngCtx, LocalRecovery};
-use crate::x3f_calc_spatial_gain;
+use crate::{x3f_calc_spatial_gain, Control, Error::InvalidData};
 
 const ANCHOR: f64 = 1.0 / 64.0;
 const NONE: u32 = u32::MAX;
@@ -73,10 +73,16 @@ fn norm(a: &[f64]) -> f64 {
     a.iter().map(|&v| magnitude(v)).fold(0.0, f64::max)
 }
 
-fn solve(rows: &[Row], rhs: &[f64], x: &mut [f64]) -> Result<(usize, f64), &'static str> {
+fn solve(
+    rows: &[Row],
+    rhs: &[f64],
+    x: &mut [f64],
+    control: Control<'_>,
+) -> crate::Result<(usize, f64)> {
+    control.check()?;
     let tolerance = 1e-9 * norm(rhs).max(1.0);
     if !tolerance.is_finite() {
-        return Err("gradient-tone right-hand side is not finite");
+        return Err(InvalidData("gradient-tone right-hand side is not finite"));
     }
     let mut ax = vec![0.0; x.len()];
     multiply(rows, x, &mut ax);
@@ -89,6 +95,7 @@ fn solve(rows: &[Row], rhs: &[f64], x: &mut [f64]) -> Result<(usize, f64), &'sta
     let mut direction = z.clone();
     let mut rz = dot(&residual, &z);
     for iteration in 0..=1000 {
+        control.check()?;
         if norm(&residual) <= tolerance {
             // Recompute the equation error instead of relying on the running estimate.
             multiply(rows, x, &mut ax);
@@ -98,17 +105,17 @@ fn solve(rows: &[Row], rhs: &[f64], x: &mut [f64]) -> Result<(usize, f64), &'sta
                 .map(|(b, a)| magnitude(b - a))
                 .fold(0.0, f64::max);
             if actual > tolerance {
-                return Err("gradient-tone true residual failed");
+                return Err(InvalidData("gradient-tone true residual failed"));
             }
             return Ok((iteration, actual));
         }
         if iteration == 1000 {
-            return Err("gradient-tone solver did not converge");
+            return Err(InvalidData("gradient-tone solver did not converge"));
         }
         multiply(rows, &direction, &mut ax);
         let denominator = dot(&direction, &ax);
         if !denominator.is_finite() || denominator <= 0.0 || !rz.is_finite() {
-            return Err("gradient-tone solver numerical breakdown");
+            return Err(InvalidData("gradient-tone solver numerical breakdown"));
         }
         let alpha = rz / denominator;
         for i in 0..x.len() {
@@ -132,16 +139,22 @@ impl Field {
         model: Option<&LocalRecovery>,
         data: &[u16],
         stride: usize,
-    ) -> Result<Self, &'static str> {
+        control: Control<'_>,
+    ) -> crate::Result<Self> {
+        control.check()?;
         let start = std::time::Instant::now();
-        let model = model.ok_or("gradient tone requires native source reliability")?;
+        let model = model.ok_or(InvalidData(
+            "gradient tone requires native source reliability",
+        ))?;
         let y = ctx
             .camera_y
-            .ok_or("gradient tone requires camera luminance")?;
+            .ok_or(InvalidData("gradient tone requires camera luminance"))?;
         let neutral = unsafe { *(ctx.prior as *const [f64; 3]) };
         let ny = dot(&y, &neutral);
         if !ny.is_finite() || ny <= 0.0 {
-            return Err("gradient tone requires positive finite neutral luminance");
+            return Err(InvalidData(
+                "gradient tone requires positive finite neutral luminance",
+            ));
         }
         let cols = ctx.cols as usize;
         let rows = ctx.rows as usize;
@@ -183,6 +196,7 @@ impl Field {
         let mut positions = Vec::new();
         let mut sources = Vec::new();
         for row in 0..rows {
+            control.check()?;
             for col in 0..cols {
                 if model.mask(row, col) == [255; 3] {
                     continue;
@@ -190,10 +204,10 @@ impl Field {
                 let s = source(row, col);
                 if s.eligible {
                     if !s.target.is_finite() || s.target <= 0.0 {
-                        return Err("invalid gradient-tone target");
+                        return Err(InvalidData("invalid gradient-tone target"));
                     }
                     if sources.len() >= NONE as usize {
-                        return Err("gradient-tone field exceeds index capacity");
+                        return Err(InvalidData("gradient-tone field exceeds index capacity"));
                     }
                     index[row * cols + col] = sources.len() as u32;
                     positions.push((row, col));
@@ -205,6 +219,9 @@ impl Field {
         let mut rhs = Vec::with_capacity(sources.len());
         let mut x = Vec::with_capacity(sources.len());
         for (i, &(row, col)) in positions.iter().enumerate() {
+            if i % 4096 == 0 {
+                control.check()?;
+            }
             let a = sources[i];
             let x0 = a.target.ln();
             let mut b = ANCHOR * x0;
@@ -243,10 +260,13 @@ impl Field {
             rhs.push(b);
             x.push(x0);
         }
-        let (iterations, residual) = solve(&matrix, &rhs, &mut x)?;
+        let (iterations, residual) = solve(&matrix, &rhs, &mut x, control)?;
         let mut no_support = 0_usize;
         let mut amplitudes = Vec::with_capacity(x.len());
         for (i, v) in x.iter().enumerate() {
+            if i % 4096 == 0 {
+                control.check()?;
+            }
             if matrix[i].diag == ANCHOR {
                 no_support += 1;
                 amplitudes.push(sources[i].amplitude);
@@ -254,10 +274,11 @@ impl Field {
             }
             let amplitude = v.exp() / ny;
             if !amplitude.is_finite() || amplitude <= 0.0 {
-                return Err("invalid gradient amplitude");
+                return Err(InvalidData("invalid gradient amplitude"));
             }
             amplitudes.push(amplitude);
         }
+        control.check()?;
         // Use the existing verbosity gate and embedding callback, not stderr.
         unsafe {
             crate::x3f_printf(crate::x3f_verbosity_t_DEBUG,
@@ -344,7 +365,7 @@ mod tests {
         let g = 0.1;
         let rhs = [ANCHOR * initial[0] - g, ANCHOR * initial[1] + g];
         let mut x = initial;
-        solve(&rows, &rhs, &mut x).unwrap();
+        solve(&rows, &rhs, &mut x, Control::none()).unwrap();
         let difference = (ANCHOR * (initial[1] - initial[0]) + 2.0 * g) / (ANCHOR + 2.0);
         assert!((x[1] - x[0] - difference).abs() < 1e-12);
         assert!((x.iter().sum::<f64>() - 3.0).abs() < 1e-12);
@@ -357,9 +378,14 @@ mod tests {
             weights: [0.0; 4],
         }];
         let mut x = [1.25];
-        assert_eq!(solve(&rows, &[ANCHOR * 1.25], &mut x).unwrap().0, 0);
+        assert_eq!(
+            solve(&rows, &[ANCHOR * 1.25], &mut x, Control::none())
+                .unwrap()
+                .0,
+            0
+        );
         assert_eq!(x, [1.25]);
-        assert_eq!(solve(&[], &[], &mut []).unwrap(), (0, 0.0));
+        assert_eq!(solve(&[], &[], &mut [], Control::none()).unwrap(), (0, 0.0));
     }
     #[test]
     fn solver_reports_nonfinite_and_breakdown_inputs_without_panicking() {
@@ -368,15 +394,15 @@ mod tests {
             neighbors: [NONE; 4],
             weights: [0.0; 4],
         }];
-        assert_eq!(
-            solve(&rows, &[1.0], &mut [0.0]),
-            Err("gradient-tone solver numerical breakdown")
-        );
+        assert!(matches!(
+            solve(&rows, &[1.0], &mut [0.0], Control::none()),
+            Err(InvalidData("gradient-tone solver numerical breakdown"))
+        ));
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert_eq!(
-                solve(&rows, &[value], &mut [0.0]),
-                Err("gradient-tone right-hand side is not finite")
-            );
+            assert!(matches!(
+                solve(&rows, &[value], &mut [0.0], Control::none()),
+                Err(InvalidData("gradient-tone right-hand side is not finite"))
+            ));
             assert!(norm(&[0.0, value]).is_infinite());
         }
     }
@@ -395,11 +421,27 @@ mod tests {
                 weights: [1.0, 0.0, 0.0, 0.0],
             },
         ];
-        assert_eq!(
-            solve(&rows, &[1.0, 0.0], &mut [0.0; 2]),
-            Err("gradient-tone solver did not converge")
-        );
+        assert!(matches!(
+            solve(&rows, &[1.0, 0.0], &mut [0.0; 2], Control::none()),
+            Err(InvalidData("gradient-tone solver did not converge"))
+        ));
     }
+    #[test]
+    fn cancelled_solver_does_not_change_the_initial_solution() {
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let mut x = [1.25];
+        let rows = [Row {
+            diag: ANCHOR,
+            neighbors: [NONE; 4],
+            weights: [0.0; 4],
+        }];
+        assert!(matches!(
+            solve(&rows, &[ANCHOR * 1.25], &mut x, Control::new(&cancel)),
+            Err(crate::Error::Cancelled)
+        ));
+        assert_eq!(x, [1.25]);
+    }
+
     #[test]
     fn field_preserves_healthy_and_applies_original_onset_once() {
         let field = Field {
