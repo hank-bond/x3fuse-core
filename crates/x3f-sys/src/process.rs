@@ -2700,6 +2700,8 @@ pub unsafe extern "C" fn x3f_set_cineon(enabled: libc::c_int) {
     CINEON.with(|c| c.set(enabled != 0));
 }
 
+#[path = "color_field.rs"]
+mod color_field;
 #[path = "gradient_tone.rs"]
 mod gradient_tone;
 #[path = "highlight_color.rs"]
@@ -2731,6 +2733,7 @@ struct DngCtx<'a> {
     recovery: bool,
     camera_y: Option<[f64; 3]>,
     gradient: Option<&'a gradient_tone::Field>,
+    color_field: Option<&'a color_field::Field>,
 }
 
 // All pointed-to tables are immutable for the lifetime of both row passes.
@@ -2768,7 +2771,6 @@ unsafe fn dng_evaluate_pixel(
     // x3f_get_image supplies these coefficients only for Merrill cameras.
     // Other sensors use the reconstruction below this branch.
     if let Some(camera_y) = ctx.camera_y.filter(|_| ctx.recovery) {
-        const COLOR_RADIUS: usize = 256;
         let model = local.expect("tone anchor requires native reliability");
         let mask = model.mask(row, col);
         let measured = std::array::from_fn(|c| sg[c] * original[c]);
@@ -2777,14 +2779,31 @@ unsafe fn dng_evaluate_pixel(
         if let Some(field) = ctx.gradient {
             field.apply(row, col, &mut tone, measured, *prior);
         }
-        let evidence = if tone.available {
-            model.colorization_direction(row, col, original, COLOR_RADIUS)
-        } else {
-            None
-        };
-        let (direction, confidence) = evidence.unwrap_or(([0.0; 3], 0.0));
-        let direction = std::array::from_fn(|c| direction[c] * sg[c]);
-        return highlight_color::apply(measured, &tone, *prior, camera_y, direction, confidence);
+        if tone.available {
+            if let Some(field) = ctx.color_field {
+                let target_y = tone.amplitude
+                    * camera_y
+                        .into_iter()
+                        .zip(*prior)
+                        .map(|(a, b)| a * b)
+                        .sum::<f64>();
+                if let Some(direction) = field.estimate(
+                    row,
+                    col,
+                    measured,
+                    mask,
+                    model.repaired_site(row, col),
+                    target_y,
+                    camera_y,
+                ) {
+                    return highlight_color::apply(
+                        measured, &tone, *prior, camera_y, direction, 1.0,
+                    );
+                }
+            }
+        }
+        // Unsupported/invalid color retains the fixed tone, not another donor path.
+        return tone.samples;
     }
     let mut samples = original;
     let mut confident = false;
@@ -3301,6 +3320,7 @@ unsafe fn apply_highlight_clip_dng_impl(
         recovery,
         camera_y,
         gradient: None,
+        color_field: None,
     };
     let gradient = if gradient_enabled {
         match unsafe {
@@ -3327,6 +3347,30 @@ unsafe fn apply_highlight_clip_dng_impl(
         None
     };
     ctx.gradient = gradient.as_ref();
+    let color_field = if ctx.camera_y.is_some() {
+        match unsafe {
+            color_field::Field::build(
+                &ctx,
+                local.as_ref().expect("Merrill reliability"),
+                std::slice::from_raw_parts(img.data, total),
+                stride,
+                control,
+            )
+        } {
+            Ok(field) => Some(field),
+            Err(error) => {
+                // Match gradient-field failure cleanup before leaving the pipeline.
+                unsafe {
+                    x3f_cleanup_spatial_gain(sgain.as_mut_ptr(), sgain_num);
+                    libc::free(sat_map.cast());
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    ctx.color_field = color_field.as_ref();
     let bounds = if already_cropped {
         [0, 0, rows, cols]
     } else {
@@ -4351,6 +4395,7 @@ mod tests {
             recovery: true,
             camera_y: Some([0.0, 1.0, 0.0]),
             gradient: None,
+            color_field: None,
         }
     }
 
@@ -4451,6 +4496,85 @@ mod tests {
                 assert_eq!(a.amplitude, b.amplitude);
                 assert_eq!(a.strength, b.strength);
                 assert_eq!(a.available, b.available);
+            }
+        }
+    }
+
+    #[test]
+    fn continuous_color_keeps_tone_healthy_pixels_and_two_pass_results() {
+        use super::*;
+        let prior = [1.0; 3];
+        let matrix = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let mut ctx = recovery_test_context(&prior);
+        ctx.rows = 16;
+        ctx.cols = 24;
+        ctx.conv_matrix = matrix.as_ptr() as *mut _;
+        let stride = ctx.cols as usize * 3 + 6;
+        let mut data = vec![0u16; ctx.rows as usize * stride];
+        let mut mask = SensorReliability::new(16, 24, [0.001; 3]).unwrap();
+        for r in 0..16 {
+            for c in 0..24 {
+                let i = r * stride + c * 3;
+                data[i..i + 3].copy_from_slice(if c < 8 {
+                    &[2300, 5200, 8000]
+                } else {
+                    &[7000, 9500, 10000]
+                });
+                if c >= 8 {
+                    mask.data[r * 24 + c] = [255, 255, 0];
+                }
+            }
+        }
+        let local = LocalRecovery::build(
+            mask,
+            |r, c| std::array::from_fn(|k| data[r * stride + c * 3 + k] as f64 / 10000.0),
+            None,
+        )
+        .unwrap();
+        let gradient = unsafe {
+            gradient_tone::Field::build(&ctx, Some(&local), &data, stride, Control::none())
+        }
+        .unwrap();
+        ctx.gradient = Some(&gradient);
+        let color =
+            unsafe { color_field::Field::build(&ctx, &local, &data, stride, Control::none()) }
+                .unwrap();
+        ctx.color_field = Some(&color);
+        let mut first = Vec::new();
+        let mut changed = 0;
+        for r in 0..16 {
+            for c in 0..24 {
+                let i = r * stride + c * 3;
+                let measured = std::array::from_fn(|k| data[i + k] as f64 / 10000.0);
+                let mut tone = tone_anchor::recover_severe(
+                    measured,
+                    local.mask(r, c),
+                    prior,
+                    ctx.camera_y.unwrap(),
+                );
+                gradient.apply(r, c, &mut tone, measured, prior);
+                let result = unsafe {
+                    dng_evaluate_pixel(&ctx, Some(&local), r, c, &data[i..i + 3], ptr::null_mut())
+                };
+                assert!((result[1] - tone.samples[1]).abs() < 1e-12);
+                if c < 8 {
+                    assert_eq!(result, measured);
+                } else if result != tone.samples {
+                    changed += 1;
+                }
+                first.push(result);
+            }
+        }
+        assert!(changed > 0);
+        // Poison already-encoded neighbors. The second pass may only read its
+        // current source pixel and the immutable fields, never those neighbors.
+        for r in 0..16 {
+            for c in 0..24 {
+                let i = r * stride + c * 3;
+                assert_eq!(first[r * 24 + c], unsafe {
+                    dng_evaluate_pixel(&ctx, Some(&local), r, c, &data[i..i + 3], ptr::null_mut())
+                });
+                data[i..i + 3].fill(u16::MAX);
             }
         }
     }
@@ -4716,6 +4840,7 @@ mod tests {
             camera_y: (recovery && is_merrill_name(model_name.as_bytes()))
                 .then_some([0.0, 1.0, 0.0]),
             gradient: None,
+            color_field: None,
         };
         let model = mask.map(|mask| {
             let mut reliability = SensorReliability::new(1, 1, [0.001; 3]).unwrap();
@@ -4823,6 +4948,7 @@ mod tests {
             recovery: false,
             camera_y: None,
             gradient: None,
+            color_field: None,
         };
         let source = [2100, 600, 0];
         let sensor = unsafe { dng_evaluate_pixel(&ctx, None, 0, 0, &source, ptr::null_mut()) };

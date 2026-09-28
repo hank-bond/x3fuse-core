@@ -134,10 +134,32 @@ silently switch to another reconstruction method.
 
 ### 3. Add highlight color
 
-Nearby reliable pixels supply color ratios, not brightness or texture. These
-pixels are called *donors*. The search uses a fixed 256-pixel radius and reduces
-the weight of donors whose ratios disagree with the available layer measurements.
-A mix of inconsistent donor colors also lowers confidence.
+Color is reconstructed as a continuous field of log layer ratios on an
+eight-pixel grid. Intact boundaries supply color, not brightness or texture.
+Reliable pairs of layers at the same pixel also constrain the field. One surviving
+layer cannot determine hue. A balanced pair does not establish white, because the
+missing third layer could distinguish a colored surface from a neutral one.
+
+The field connects affected regions through agreement in reconstructed tone and
+surviving ratios. There is no fixed donor search radius. Boundary influence is
+also checked against the peak reconstructed tone and surviving ratios of the
+connected region, so a gradual path into a much darker surface does not suffice.
+Unaffected low-signal cells cannot bridge unrelated donors. These are evidence
+gates, not semantic guarantees that connected pixels belong to the same surface.
+
+A soft calibrated-neutral prior is strongest where pair evidence is absent.
+Its color metric comes from the camera matrix, rather than treating sensor-layer
+axes as equivalent. Neutrality is a preference under uncertainty, not a forced
+interpretation of balanced surviving layers. Regions without reachable donors
+still use their surviving ratios and this neutral prior.
+
+Spatial differences use that same calibrated color metric, including edges to
+intact boundaries. Equal distances in raw log-layer coordinates do not represent
+equal color differences: blending a partly clipped colored region toward a
+neutral neighbor in that geometry can rotate its hue. Using one calibrated metric
+for spatial coupling and neutrality avoids that conflict without a hue-specific
+penalty. It does not resolve every missing-layer ambiguity or correct optical
+fringing; legitimate greens and defocus fringes are not inherently recovery errors.
 
 When bad-pixel correction is enabled, camera-marked repair sites are excluded
 from Merrill color donors. Their interpolated values are replacements, not
@@ -146,13 +168,21 @@ from layer clipping reliability: it does not change tone reconstruction, repair
 itself, or the exported source-reliability mask. Recovery-off, older-sensor and
 Quattro processing retain their existing behavior.
 
-The color stage scales the selected ratios to the reconstructed brightness.
-Without usable donor color, it keeps the tone result. Recovery strength increases
-smoothly as layer reliability falls. This blend is applied once, not once per stage.
-Large clipped regions can lack valid donors within the search radius. They may
-become neutral, with visible color transitions at the boundary of donor support.
-Excluding contaminated donors prevents false color but does not solve that
-remaining limitation.
+Joint-guided interpolation brings the solved field back to native resolution.
+The native fit balances that field with reliable same-pixel ratios and normalizes
+the resulting direction to the fixed camera-PCS luminance. Ratios are soft
+constraints, not promises to retain absolute surviving-layer amplitudes alongside
+an independently reconstructed tone. Recovery strength increases smoothly as
+layer reliability falls. This blend is applied once, not once per stage. Fully
+reliable pixels retain their normalized sensor samples before shared output
+scaling and 16-bit encoding.
+
+The immutable color field is shared by headroom measurement and encoding. Its
+block-preconditioned conjugate-gradient solve checks cancellation and validates
+the true residual. Invalid calibration or nonconvergence stops conversion rather
+than silently selecting another donor algorithm. This replaces the earlier local
+radius-limited color estimator. Tone reconstruction and recovery onset are
+unchanged.
 
 ## Rust API
 
@@ -192,12 +222,12 @@ The following files are under `crates/x3f-sys/src/`:
 | `highlight_recovery.rs` | Store layer reliability and donor data, and reconstruct older native-sensor highlights. |
 | `tone_anchor.rs` | Estimate each affected pixel's starting brightness. |
 | `gradient_tone.rs` | Solve for brightness using neighboring layer differences. |
-| `donor_chroma.rs` | Estimate nearby color ratios and confidence. |
+| `color_field.rs` | Solve continuous highlight color from intact boundaries, surviving ratios and a calibrated-neutral prior. |
 | `highlight_color.rs` | Apply those ratios at the chosen brightness. |
 | `recovery_mask.rs` | Write the optional source-reliability mask. |
 
-The gradient field is built before the headroom and encoding passes. Both passes
-read the same field and donor data. Encoding writes pixels in place without reading
+The gradient and color fields are built before the headroom and encoding passes.
+Both passes read the same immutable fields and source reliability. Encoding writes pixels in place without reading
 neighbors that might already have been overwritten.
 
 Calibration helpers live under `crates/x3f-core/src/output/dng/`. The

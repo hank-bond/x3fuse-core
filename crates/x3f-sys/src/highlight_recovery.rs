@@ -8,9 +8,6 @@ use crate::sysabi as libc;
 use std::ffi::CStr;
 use std::ptr;
 
-#[path = "donor_chroma.rs"]
-mod donor_chroma;
-
 const TILE_SIZE: usize = 16;
 const PYRAMID_LEVELS: usize = 5;
 const MIN_DONORS: f64 = 8.0;
@@ -387,6 +384,13 @@ impl LocalRecovery {
         self.reliability.data[row * self.reliability.cols + col]
     }
 
+    /// Interpolated repair values are not independent color measurements.
+    pub fn repaired_site(&self, row: usize, col: usize) -> bool {
+        row >= self.reliability.rows
+            || col >= self.reliability.cols
+            || self.reliability.repair_marked[row * self.reliability.cols + col]
+    }
+
     pub fn has_camera_maps(&self) -> bool {
         self.reliability.camera_map_channels != 0
     }
@@ -593,27 +597,6 @@ impl LocalRecovery {
         let mut reference = s;
         reference[target] = predicted;
         Some((reference, confidence.clamp(0.0, 1.0)))
-    }
-
-    /// Chromaticity evidence for the Merrill reconstruction branch, not
-    /// reconstructed layer values. Uses the existing healthy donor admission.
-    pub fn colorization_direction(
-        &self,
-        row: usize,
-        col: usize,
-        s: [f64; 3],
-        radius: usize,
-    ) -> Option<([f64; 3], f64)> {
-        if row >= self.reliability.rows || col >= self.reliability.cols {
-            return None;
-        }
-        donor_chroma::Settings::colorization(radius).estimate(
-            &self.levels[0],
-            [row as f64, col as f64],
-            s,
-            self.mask(row, col),
-            self.reliability.noise,
-        )
     }
 
     pub fn recover(&self, row: usize, col: usize, s: [f64; 3], prior: [f64; 3]) -> RecoveryResult {
