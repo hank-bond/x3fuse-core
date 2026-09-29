@@ -39,13 +39,7 @@ pub(super) fn write(
             "invalid mask bounds",
         ));
     }
-    let excluded = write_file(path, bounds, |r, c| model.mask(r, c), control)?;
-    unsafe {
-        crate::x3f_printf(crate::x3f_verbosity_t_DEBUG,
-            c"DNG_RECOVERY_MASK bounds=[%zu, %zu, %zu, %zu] excluded=%zu policy=any_layer_below_255\n".as_ptr(),
-            bounds[0], bounds[1], bounds[2], bounds[3], excluded);
-    }
-    Ok(())
+    write_file(path, bounds, |r, c| model.mask(r, c), control)
 }
 
 fn check_cancel(control: Control<'_>) -> io::Result<()> {
@@ -59,15 +53,14 @@ fn write_file(
     bounds: [usize; 4],
     mask: impl FnMut(usize, usize) -> [u8; 3],
     control: Control<'_>,
-) -> io::Result<usize> {
+) -> io::Result<()> {
     check_cancel(control)?;
     let file = OpenOptions::new().write(true).create_new(true).open(path)?;
     let mut out = BufWriter::new(file);
-    let excluded = write_mask(&mut out, bounds, mask, control)?;
+    write_mask(&mut out, bounds, mask, control)?;
     out.flush()?;
     out.get_ref().sync_all()?;
-    check_cancel(control)?;
-    Ok(excluded)
+    check_cancel(control)
 }
 
 fn write_mask(
@@ -75,23 +68,21 @@ fn write_mask(
     bounds: [usize; 4],
     mut mask: impl FnMut(usize, usize) -> [u8; 3],
     control: Control<'_>,
-) -> io::Result<usize> {
+) -> io::Result<()> {
     check_cancel(control)?;
     let [top, left, bottom, right] = bounds;
     assert!(top < bottom && left < right);
     let width = right - left;
     writeln!(out, "P5\n{width} {}\n255", bottom - top)?;
     let mut row = vec![0; width];
-    let mut excluded = 0;
     for r in top..bottom {
         check_cancel(control)?;
         for (i, c) in (left..right).enumerate() {
             row[i] = if mask(r, c) == [255; 3] { 0 } else { 255 };
-            excluded += usize::from(row[i] != 0);
         }
         out.write_all(&row)?;
     }
-    Ok(excluded)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -151,16 +142,13 @@ mod tests {
         let directory = std::env::temp_dir().join(name);
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("mask.pgm");
-        assert_eq!(
-            write_file(
-                &path,
-                [0, 0, 1, 2],
-                |_, c| if c == 0 { [255; 3] } else { [0; 3] },
-                Control::none()
-            )
-            .unwrap(),
-            1
-        );
+        write_file(
+            &path,
+            [0, 0, 1, 2],
+            |_, c| if c == 0 { [255; 3] } else { [0; 3] },
+            Control::none(),
+        )
+        .unwrap();
         let expected = b"P5\n2 1\n255\n\x00\xff";
         assert_eq!(std::fs::read(&path).unwrap(), expected);
         assert_eq!(
@@ -189,10 +177,7 @@ mod tests {
     fn healthy_partial_and_fully_clipped_are_distinguished() {
         let source = [[255; 3], [254, 255, 255], [255, 0, 255], [0; 3]];
         let mut out = Vec::new();
-        assert_eq!(
-            write_mask(&mut out, [0, 0, 1, 4], |_, c| source[c], Control::none()).unwrap(),
-            3
-        );
+        write_mask(&mut out, [0, 0, 1, 4], |_, c| source[c], Control::none()).unwrap();
         assert_eq!(out, b"P5\n4 1\n255\n\x00\xff\xff\xff");
         assert_eq!(source[0], [255; 3]);
     }

@@ -73,12 +73,7 @@ fn norm(a: &[f64]) -> f64 {
     a.iter().map(|&v| magnitude(v)).fold(0.0, f64::max)
 }
 
-fn solve(
-    rows: &[Row],
-    rhs: &[f64],
-    x: &mut [f64],
-    control: Control<'_>,
-) -> crate::Result<(usize, f64)> {
+fn solve(rows: &[Row], rhs: &[f64], x: &mut [f64], control: Control<'_>) -> crate::Result<()> {
     control.check()?;
     let tolerance = 1e-9 * norm(rhs).max(1.0);
     if !tolerance.is_finite() {
@@ -107,7 +102,7 @@ fn solve(
             if actual > tolerance {
                 return Err(InvalidData("gradient-tone true residual failed"));
             }
-            return Ok((iteration, actual));
+            return Ok(());
         }
         if iteration == 1000 {
             return Err(InvalidData("gradient-tone solver did not converge"));
@@ -142,7 +137,6 @@ impl Field {
         control: Control<'_>,
     ) -> crate::Result<Self> {
         control.check()?;
-        let start = std::time::Instant::now();
         let model = model.ok_or(InvalidData(
             "gradient tone requires native source reliability",
         ))?;
@@ -260,15 +254,13 @@ impl Field {
             rhs.push(b);
             x.push(x0);
         }
-        let (iterations, residual) = solve(&matrix, &rhs, &mut x, control)?;
-        let mut no_support = 0_usize;
+        solve(&matrix, &rhs, &mut x, control)?;
         let mut amplitudes = Vec::with_capacity(x.len());
         for (i, v) in x.iter().enumerate() {
             if i % 4096 == 0 {
                 control.check()?;
             }
             if matrix[i].diag == ANCHOR {
-                no_support += 1;
                 amplitudes.push(sources[i].amplitude);
                 continue;
             }
@@ -279,13 +271,6 @@ impl Field {
             amplitudes.push(amplitude);
         }
         control.check()?;
-        // Use the existing verbosity gate and embedding callback, not stderr.
-        unsafe {
-            crate::x3f_printf(crate::x3f_verbosity_t_DEBUG,
-                c"DNG_RECOVERY_GRADIENT nodes=%zu unsupported=%zu anchor=%.17f iterations=%zu residual=%.17e rhs_norm=%.17e elapsed_s=%.3f\n".as_ptr(),
-                sources.len(), no_support, ANCHOR, iterations, residual,
-                norm(&rhs), start.elapsed().as_secs_f64());
-        }
         Ok(Self {
             cols,
             index,
@@ -378,14 +363,9 @@ mod tests {
             weights: [0.0; 4],
         }];
         let mut x = [1.25];
-        assert_eq!(
-            solve(&rows, &[ANCHOR * 1.25], &mut x, Control::none())
-                .unwrap()
-                .0,
-            0
-        );
+        solve(&rows, &[ANCHOR * 1.25], &mut x, Control::none()).unwrap();
         assert_eq!(x, [1.25]);
-        assert_eq!(solve(&[], &[], &mut [], Control::none()).unwrap(), (0, 0.0));
+        solve(&[], &[], &mut [], Control::none()).unwrap();
     }
     #[test]
     fn solver_reports_nonfinite_and_breakdown_inputs_without_panicking() {

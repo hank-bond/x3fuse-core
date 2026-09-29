@@ -54,7 +54,7 @@ fn affinity(a: Guide, b: Guide) -> f64 {
         w
     }
 }
-/// Limit only N's neutralward move, not M's field or the evidence weights.
+/// Limit the neutralward adjustment, not the field or the evidence weights.
 /// The bound allows one existing agreement scale of additional weighted error;
 /// this is a conservative heuristic, not a calibrated noise confidence interval.
 fn retained_neutral_move(before: [f64; 2], proposed: [f64; 2], g: Guide) -> f64 {
@@ -242,9 +242,9 @@ fn solve(
     rhs: &[[f64; 2]],
     x: &mut [[f64; 2]],
     control: Control<'_>,
-) -> crate::Result<(usize, f64)> {
+) -> crate::Result<()> {
     if rows.is_empty() {
-        return Ok((0, 0.0));
+        return Ok(());
     }
     if rows.iter().any(|e| {
         e.block.iter().any(|v| !v.is_finite())
@@ -287,7 +287,7 @@ fn solve(
             {
                 return Err(InvalidData("color field true residual failed"));
             }
-            return Ok((iteration, actual));
+            return Ok(());
         }
         if iteration == 4000 {
             return Err(InvalidData("color field did not converge"));
@@ -486,7 +486,7 @@ impl Field {
         }
         Ok(())
     }
-    fn reconstruct(&mut self, control: Control<'_>) -> crate::Result<(usize, usize, f64)> {
+    fn reconstruct(&mut self, control: Control<'_>) -> crate::Result<()> {
         self.connect(control)?;
         let mut index = vec![NONE; self.nodes.len()];
         let mut active = Vec::new();
@@ -545,11 +545,11 @@ impl Field {
                 self.prior.neutral
             });
         }
-        let (iterations, residual) = solve(&equations, &rhs, &mut x, control)?;
+        solve(&equations, &rhs, &mut x, control)?;
         for (k, &i) in active.iter().enumerate() {
             self.nodes[i].color = x[k];
         }
-        Ok((active.len(), iterations, residual))
+        Ok(())
     }
     /// Read-only access to the same post-repair, post-denoise source as the
     /// headroom/encoding passes. Build once before either pass overwrites pixels.
@@ -560,7 +560,6 @@ impl Field {
         stride: usize,
         control: Control<'_>,
     ) -> crate::Result<Self> {
-        let start = std::time::Instant::now();
         let rows = (ctx.rows as usize).div_ceil(STEP);
         let cols = (ctx.cols as usize).div_ceil(STEP);
         let mut nodes = vec![Node::default(); rows * cols];
@@ -658,16 +657,7 @@ impl Field {
             vertical: vec![0.0; size],
             prior: ColorPrior::new(neutral, unsafe { *(ctx.conv_matrix as *const [f64; 9]) })?,
         };
-        let (unknowns, iterations, residual) = result.reconstruct(control)?;
-        let anchors = result.nodes.iter().filter(|n| n.fixed).count();
-        let donorless = result
-            .nodes
-            .iter()
-            .filter(|n| n.affected && !n.distance.is_finite())
-            .count();
-        unsafe {
-            crate::x3f_printf(crate::x3f_verbosity_t_DEBUG,c"DNG_RECOVERY_COLOR_FIELD nodes=%zu anchors=%zu unknowns=%zu donorless=%zu iterations=%zu residual=%.17e elapsed_s=%.3f\n".as_ptr(),size,anchors,unknowns,donorless,iterations,residual,start.elapsed().as_secs_f64());
-        }
+        result.reconstruct(control)?;
         Ok(result)
     }
     /// Estimate color only. Repaired sites and a single surviving layer supply
@@ -734,7 +724,7 @@ impl Field {
         let before = inverse(old_block, old_rhs);
         let retained = retained_neutral_move(before, proposed, guide);
         // The fit is affine in its prior. Limit both consistently, including
-        // the existing invalid-ray fallback. Keep unbounded N exactly as-is.
+        // the invalid-ray fallback. Retain an admissible proposal without interpolation.
         let (fit, prior) = if retained == 1.0 {
             (proposed, proposed_prior)
         } else {

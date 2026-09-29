@@ -3497,15 +3497,6 @@ unsafe fn apply_highlight_clip_dng_impl(
                 .map(|(row, data)| evaluate_row(row, data, ptr::null_mut()))
                 .reduce(|| 1.0, f64::max)
         };
-        if ctx.camera_y.is_some() {
-            unsafe {
-                x3f_printf(
-                    x3f_verbosity_t_DEBUG,
-                    c"DNG_RECOVERY_HEADROOM maximum=%.17f\n".as_ptr(),
-                    maximum,
-                );
-            }
-        }
         maximum = maximum.clamp(1.0, DNG_MAX_HEADROOM);
         data.par_chunks_mut(stride)
             .enumerate()
@@ -4727,16 +4718,9 @@ mod tests {
             std::fs::remove_file(path).unwrap();
             report_dng_recovery_error("test logging failure");
             let mut messages = MESSAGES.lock().unwrap();
-            if level == x3f_verbosity_t_DEBUG {
-                assert_eq!(messages.len(), 3);
-                assert_eq!(messages[0].0, x3f_verbosity_t_DEBUG);
-                assert!(messages[0]
-                    .1
-                    .starts_with("DNG_RECOVERY_GRADIENT nodes=0 unsupported=0 "));
-                assert_eq!(messages[1], (x3f_verbosity_t_DEBUG, "DNG_RECOVERY_MASK bounds=[0, 0, 1, 1] excluded=0 policy=any_layer_below_255\n".to_owned()));
-            } else {
-                assert_eq!(messages.len(), 1);
-            }
+            // Successful field/mask operations no longer emit research statistics.
+            // Failures still reach the embedding callback at every verbosity.
+            assert_eq!(messages.len(), 1);
             assert_eq!(
                 messages.last().unwrap(),
                 &(
