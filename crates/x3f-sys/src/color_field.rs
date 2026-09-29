@@ -10,6 +10,7 @@ use std::{cmp::Ordering, collections::BinaryHeap};
 const STEP: usize = 8;
 const NONE: usize = usize::MAX;
 const DATA_WEIGHT: f64 = 4.0;
+const PAIR_SCALE: f64 = 0.035;
 
 fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
     a.into_iter().zip(b).map(|(x, y)| x * y).sum()
@@ -44,7 +45,7 @@ fn affinity(a: Guide, b: Guide) -> f64 {
     }
     let t = (a.tone - b.tone) / (0.25 * std::f64::consts::LN_2);
     let disagreement = (0..3)
-        .map(|k| a.q[k].min(b.q[k]) * ((a.pair[k] - b.pair[k]) / 0.035).powi(2))
+        .map(|k| a.q[k].min(b.q[k]) * ((a.pair[k] - b.pair[k]) / PAIR_SCALE).powi(2))
         .fold(0.0_f64, f64::max);
     let w = (-0.5 * (t * t + disagreement)).exp();
     if w < 1e-4 {
@@ -52,6 +53,29 @@ fn affinity(a: Guide, b: Guide) -> f64 {
     } else {
         w
     }
+}
+/// Limit only N's neutralward move, not M's field or the evidence weights.
+/// The bound allows one existing agreement scale of additional weighted error;
+/// this is a conservative heuristic, not a calibrated noise confidence interval.
+fn retained_neutral_move(before: [f64; 2], proposed: [f64; 2], g: Guide) -> f64 {
+    let ratios = |v: [f64; 2]| [v[0] - v[1], v[0], v[1]];
+    let a = ratios(before);
+    let b = ratios(proposed);
+    let mut retained: f64 = 1.0;
+    for k in 0..3 {
+        if g.q[k] <= 0.0 {
+            continue;
+        }
+        let trust = g.q[k].sqrt();
+        let old_error = trust * (a[k] - g.pair[k]);
+        let new_error = trust * (b[k] - g.pair[k]);
+        let bound = old_error.abs() + PAIR_SCALE;
+        if new_error.abs() > bound {
+            let edge = bound.copysign(new_error);
+            retained = retained.min((edge - old_error) / (new_error - old_error));
+        }
+    }
+    retained.clamp(0.0, 1.0)
 }
 fn neutral_weight(g: Guide) -> f64 {
     let trust = g.q.into_iter().fold(0.0_f64, f64::max).clamp(0.0, 1.0);
@@ -63,6 +87,18 @@ struct ColorPrior {
     metric: [f64; 3],
 }
 impl ColorPrior {
+    /// A solved field can disagree with native evidence even when its coarse
+    /// guide averages agree. Borrow only the compatible part of that proposal;
+    /// keep the existing uncertainty reference, not a semantic white decision.
+    fn compatible_target(self, field: [f64; 2], guide: Guide) -> [f64; 2] {
+        let proposal = Guide {
+            pair: [field[0] - field[1], field[0], field[1]],
+            q: [1.0; 3],
+            tone: guide.tone,
+        };
+        let confidence = affinity(guide, proposal);
+        std::array::from_fn(|k| self.neutral[k] + confidence * (field[k] - self.neutral[k]))
+    }
     fn new(p: [f64; 3], m: [f64; 9]) -> crate::Result<Self> {
         let rgb: [f64; 3] = std::array::from_fn(|r| (0..3).map(|c| m[3 * r + c] * p[c]).sum());
         if p.iter()
@@ -688,14 +724,26 @@ impl Field {
         } else {
             (p.neutral, f64::INFINITY)
         };
+        let proposed_prior = p.compatible_target(prior, guide);
+        let weight = 0.25 + 1.75 * (-distance / 256.0).exp();
         let (mut block, mut rhs) = data_equation(guide);
-        p.add(
-            &mut block,
-            &mut rhs,
-            prior,
-            0.25 + 1.75 * (-distance / 256.0).exp(),
-        );
-        direction(inverse(block, rhs), y)
+        p.add(&mut block, &mut rhs, proposed_prior, weight);
+        let proposed = inverse(block, rhs);
+        let (mut old_block, mut old_rhs) = data_equation(guide);
+        p.add(&mut old_block, &mut old_rhs, prior, weight);
+        let before = inverse(old_block, old_rhs);
+        let retained = retained_neutral_move(before, proposed, guide);
+        // The fit is affine in its prior. Limit both consistently, including
+        // the existing invalid-ray fallback. Keep unbounded N exactly as-is.
+        let (fit, prior) = if retained == 1.0 {
+            (proposed, proposed_prior)
+        } else {
+            (
+                std::array::from_fn(|k| before[k] + retained * (proposed[k] - before[k])),
+                std::array::from_fn(|k| prior[k] + retained * (proposed_prior[k] - prior[k])),
+            )
+        };
+        direction(fit, y)
             .or_else(|| direction(prior, y))
             .or_else(|| direction(p.neutral, y))
     }
@@ -734,6 +782,104 @@ mod tests {
         f.nodes[0].affected = false;
         f.nodes[0].color = prior.neutral;
         f
+    }
+    #[test]
+    fn compatible_non_neutral_color_is_not_rejected_by_a_balanced_pair() {
+        let p = ColorPrior::new(P, M).unwrap();
+        let field = [p.neutral[0] + 0.3, p.neutral[1] + 0.3];
+        let g = Guide {
+            pair: [field[0] - field[1], 0.0, 0.0],
+            q: [1.0, 0.0, 0.0],
+            tone: 0.0,
+        };
+        assert_eq!(p.compatible_target(field, g), field);
+        assert_ne!(field, p.neutral);
+    }
+    #[test]
+    fn only_trusted_conflicting_pairs_can_decline_a_borrowed_color() {
+        let p = ColorPrior::new(P, M).unwrap();
+        let field = [p.neutral[0] + 0.35, p.neutral[1]];
+        let mut g = Guide {
+            pair: [p.neutral[0] - p.neutral[1], 0.0, 0.0],
+            q: [1.0, 0.0, 0.0],
+            tone: 0.0,
+        };
+        assert_eq!(p.compatible_target(field, g), p.neutral);
+        g.q = [0.0; 3];
+        assert_eq!(p.compatible_target(field, g), field);
+        g.q = [0.001, 0.0, 0.0];
+        let weak = p.compatible_target(field, g);
+        assert!(weak[0] > p.neutral[0] && weak[0] < field[0]);
+    }
+    #[test]
+    fn neutral_move_retains_compatible_or_unsupported_changes() {
+        let mut g = Guide {
+            pair: [0.0; 3],
+            q: [1.0, 0.0, 0.0],
+            tone: 0.0,
+        };
+        assert_eq!(retained_neutral_move([0.04, 0.0], [0.041, 0.0], g), 1.0);
+        assert_eq!(retained_neutral_move([0.04, 0.0], [0.01, 0.0], g), 1.0);
+        // A move along the unobserved direction cannot be vetoed by B/M.
+        assert_eq!(retained_neutral_move([0.04, 0.0], [1.04, 1.0], g), 1.0);
+        g.q = [0.0; 3];
+        assert_eq!(retained_neutral_move([0.04, 0.0], [-0.8, 0.5], g), 1.0);
+    }
+    #[test]
+    fn neutral_move_limits_crossing_past_a_trustworthy_ratio() {
+        let g = Guide {
+            pair: [0.0; 3],
+            q: [1.0, 0.0, 0.0],
+            tone: 0.0,
+        };
+        let retained = retained_neutral_move([0.04, 0.0], [-0.17, 0.0], g);
+        assert!((retained - (0.04 + 0.075) / 0.21).abs() < 1e-14);
+        assert!((0.04 + retained * (-0.17 - 0.04) + 0.075).abs() < 1e-14);
+        let weak = Guide {
+            q: [0.01, 0.0, 0.0],
+            ..g
+        };
+        assert_eq!(retained_neutral_move([0.04, 0.0], [-0.17, 0.0], weak), 1.0);
+    }
+    #[test]
+    fn neutral_move_bound_holds_for_each_pair_and_is_maximal() {
+        let ratios = |v: [f64; 2]| [v[0] - v[1], v[0], v[1]];
+        for a in -4..=4 {
+            for b in -4..=4 {
+                for c in -4..=4 {
+                    for q in [
+                        [1.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0],
+                        [0.0, 0.0, 1.0],
+                        [1.0, 0.3, 0.1],
+                    ] {
+                        let before = [a as f64 * 0.09, b as f64 * 0.08];
+                        let proposed = [c as f64 * 0.12, -a as f64 * 0.07];
+                        let g = Guide {
+                            pair: [0.03, 0.1, 0.07],
+                            q,
+                            tone: 0.0,
+                        };
+                        let t = retained_neutral_move(before, proposed, g);
+                        assert!((0.0..=1.0).contains(&t));
+                        let allowed = |t: f64, tolerance: f64| {
+                            let fit =
+                                std::array::from_fn(|k| before[k] + t * (proposed[k] - before[k]));
+                            (0..3).all(|k| {
+                                q[k].sqrt() * (ratios(fit)[k] - g.pair[k]).abs()
+                                    <= q[k].sqrt() * (ratios(before)[k] - g.pair[k]).abs()
+                                        + PAIR_SCALE
+                                        + tolerance
+                            })
+                        };
+                        assert!(allowed(t, 1e-12));
+                        if t < 1.0 - 1e-7 {
+                            assert!(!allowed(t + 1e-7, 0.0));
+                        }
+                    }
+                }
+            }
+        }
     }
     #[test]
     fn balanced_pair_is_ambiguous_not_extra_evidence_for_white() {
