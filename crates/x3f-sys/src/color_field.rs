@@ -8,15 +8,81 @@
 use super::{tone_anchor, DngCtx, LocalRecovery};
 use crate::{Control, Error::InvalidData};
 use std::{cmp::Ordering, collections::BinaryHeap};
-const STEP: usize = 8;
+
+// Behavior tuning
+// These values are empirical choices, not calibrated noise estimates. They change
+// the recovered color. Weights are equation coefficients, not mixing percentages.
+
+// Evidence uses normalized, spatial-gain-corrected layer samples. Larger powers
+// discount partial reliability more strongly. Signal trust ramps from zero at
+// the start value over the transition width. The donor threshold applies to
+// every layer of an intact boundary donor.
+const RELIABILITY_POWER: i32 = 4;
+const SIGNAL_TRUST_START: f64 = 0.002;
+const SIGNAL_TRUST_WIDTH: f64 = 0.018;
+const MIN_DONOR_SIGNAL: f64 = 0.02;
+
+// Larger agreement scales admit greater differences. Tone scales are in stops,
+// and pair scales are natural-log layer ratios. The boundary check compares with
+// the brightest cell in the connected region. The minimum affinity cuts off
+// weak graph links, interpolation weights, and native color compatibility.
+const LOCAL_TONE_SCALE_EV: f64 = 0.25;
+const PAIR_AGREEMENT_SCALE: f64 = 0.035;
+const BOUNDARY_TONE_SCALE_EV: f64 = 0.75;
+const BOUNDARY_PAIR_SCALE: f64 = 0.12;
+const MIN_AFFINITY: f64 = 1e-4;
+
+// Stronger data weight favors measured pairs in both grid and native fits.
+// Neutral weight reaches its floor with even one fully trusted pair, although
+// that pair alone does not determine hue. The extra weight grows as trust falls.
+// Keep the floor positive so an isolated cell retains a nonsingular system.
+const PAIR_DATA_WEIGHT: f64 = 4.0;
+const NEUTRAL_WEIGHT_FLOOR: f64 = 0.0001;
+const NEUTRAL_UNCERTAINTY_WEIGHT: f64 = 0.04;
+const NEUTRAL_UNCERTAINTY_POWER: i32 = 2;
+
+// Native fitting uses floor + boost at a donor and approaches the floor with
+// distance. Distance is affinity-weighted graph length in native-pixel units,
+// not a geometric search radius. Larger scales retain field influence farther.
+const NATIVE_FIELD_WEIGHT_FLOOR: f64 = 0.25;
+const NATIVE_FIELD_WEIGHT_BOOST: f64 = 1.75;
+const DONOR_DISTANCE_SCALE_PIXELS: f64 = 256.0;
+
+// Additional reliability-weighted log-ratio error allowed by the neutralward
+// guard. This allowance deliberately follows the pair-agreement scale above.
+const PAIR_ERROR_ALLOWANCE: f64 = PAIR_AGREEMENT_SCALE;
+
+// Grid resolution and donor support
+// Spacing controls aggregation and cost, not just color strength. The minimum
+// donor count applies per cell, so review both settings when changing resolution.
+// Keep the count positive so boundary cells contain measured color.
+const GRID_STEP_PIXELS: usize = 8;
+const MIN_BOUNDARY_DONORS: f64 = 8.0;
+
+// Numerical safeguards and solver controls
+// These are validity and convergence limits, not color-strength controls.
+// Changing them can still alter accepted samples, fallbacks, or output bytes.
+const MIN_LOG_INPUT: f64 = 1e-12; // Floor layer samples before taking logarithms.
+const MIN_CELL_LUMINANCE: f64 = 1e-9; // Require positive support for guides and donors.
+const MIN_METRIC_EIGENVALUE: f64 = 1e-9; // Reject nearly singular camera metrics.
+const MAX_ABS_LOG_RATIO: f64 = 30.0; // Reject extreme directions before normalization.
+const MIN_DIRECTION_LUMINANCE: f64 = 1e-12; // Avoid division by negligible luminance.
+const MIN_INTERPOLATION_WEIGHT: f64 = 1e-12; // Require support before averaging the field.
+
+// Tolerance is absolute up to a right-hand-side norm of one, and relative above it.
+const SOLVER_TOLERANCE: f64 = 1e-9;
+const MAX_SOLVER_ITERATIONS: i32 = 4000;
+const CANCEL_CHECK_INTERVAL: usize = 65_536; // Graph work between cancellation checks.
+
+// Representation constants, not tuning parameters.
+const FULL_RELIABILITY: u8 = u8::MAX;
 const NONE: usize = usize::MAX;
-const DATA_WEIGHT: f64 = 4.0;
-const PAIR_SCALE: f64 = 0.035;
 
 fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
     a.into_iter().zip(b).map(|(x, y)| x * y).sum()
 }
 fn smooth(x: f64) -> f64 {
+    // The fixed cubic coefficients give zero slope at both endpoints.
     let x = x.clamp(0.0, 1.0);
     x * x * (3.0 - 2.0 * x)
 }
@@ -25,10 +91,11 @@ fn evidence(m: [f64; 3], mask: [u8; 3], repaired: bool) -> ([f64; 3], [f64; 3]) 
         if repaired || !m[c].is_finite() {
             0.0
         } else {
-            (mask[c] as f64 / 255.0).powi(4) * smooth((m[c] - 0.002) / 0.018)
+            (mask[c] as f64 / FULL_RELIABILITY as f64).powi(RELIABILITY_POWER)
+                * smooth((m[c] - SIGNAL_TRUST_START) / SIGNAL_TRUST_WIDTH)
         }
     });
-    let l = m.map(|v| v.max(1e-12).ln());
+    let l = m.map(|v| v.max(MIN_LOG_INPUT).ln());
     (
         [l[0] - l[1], l[0] - l[2], l[1] - l[2]],
         [q[0] * q[1], q[0] * q[2], q[1] * q[2]],
@@ -48,11 +115,12 @@ fn agreement(a: Guide, b: Guide, tone_scale: f64, pair_scale: f64) -> f64 {
     let disagreement = (0..3)
         .map(|k| a.q[k].min(b.q[k]) * ((a.pair[k] - b.pair[k]) / pair_scale).powi(2))
         .fold(0.0_f64, f64::max);
+    // Squared distances and the -1/2 factor define the Gaussian form.
     (-0.5 * (t * t + disagreement)).exp()
 }
 fn affinity(a: Guide, b: Guide) -> f64 {
-    let w = agreement(a, b, 0.25, PAIR_SCALE);
-    if w < 1e-4 {
+    let w = agreement(a, b, LOCAL_TONE_SCALE_EV, PAIR_AGREEMENT_SCALE);
+    if w < MIN_AFFINITY {
         0.0
     } else {
         w
@@ -73,7 +141,7 @@ fn retained_neutral_move(before: [f64; 2], proposed: [f64; 2], g: Guide) -> f64 
         let trust = g.q[k].sqrt();
         let old_error = trust * (a[k] - g.pair[k]);
         let new_error = trust * (b[k] - g.pair[k]);
-        let bound = old_error.abs() + PAIR_SCALE;
+        let bound = old_error.abs() + PAIR_ERROR_ALLOWANCE;
         if new_error.abs() > bound {
             let edge = bound.copysign(new_error);
             retained = retained.min((edge - old_error) / (new_error - old_error));
@@ -82,8 +150,9 @@ fn retained_neutral_move(before: [f64; 2], proposed: [f64; 2], g: Guide) -> f64 
     retained.clamp(0.0, 1.0)
 }
 fn neutral_weight(g: Guide) -> f64 {
-    let trust = g.q.into_iter().fold(0.0_f64, f64::max).clamp(0.0, 1.0);
-    0.0001 + 0.04 * (1.0 - trust).powi(2)
+    let strongest_pair_trust = g.q.into_iter().fold(0.0_f64, f64::max).clamp(0.0, 1.0);
+    let uncertainty = 1.0 - strongest_pair_trust;
+    NEUTRAL_WEIGHT_FLOOR + NEUTRAL_UNCERTAINTY_WEIGHT * uncertainty.powi(NEUTRAL_UNCERTAINTY_POWER)
 }
 #[derive(Clone, Copy)]
 struct ColorPrior {
@@ -118,8 +187,9 @@ impl ColorPrior {
         let a = j[0][0] * j[0][0] + j[1][0] * j[1][0];
         let b = j[0][1] * j[0][1] + j[1][1] * j[1][1];
         let c = j[0][0] * j[0][1] + j[1][0] * j[1][1];
+        // Fixed coefficients of the smaller eigenvalue of a symmetric 2x2 matrix.
         let minimum = 0.5 * (a + b - ((a - b) * (a - b) + 4.0 * c * c).sqrt());
-        if !minimum.is_finite() || minimum <= 1e-9 {
+        if !minimum.is_finite() || minimum <= MIN_METRIC_EIGENVALUE {
             return Err(InvalidData("singular neutral color metric"));
         }
         Ok(Self {
@@ -141,7 +211,7 @@ impl ColorPrior {
     }
 }
 fn surface_agreement(a: Guide, b: Guide) -> f64 {
-    agreement(a, b, 0.75, 0.12)
+    agreement(a, b, BOUNDARY_TONE_SCALE_EV, BOUNDARY_PAIR_SCALE)
 }
 #[derive(Clone)]
 struct Node {
@@ -254,7 +324,7 @@ fn solve(
     }) {
         return Err(InvalidData("color field preconditioner not positive"));
     }
-    let tolerance = 1e-9 * norm(rhs).max(1.0);
+    let tolerance = SOLVER_TOLERANCE * norm(rhs).max(1.0);
     if !tolerance.is_finite() {
         return Err(InvalidData("color field RHS not finite"));
     }
@@ -272,7 +342,7 @@ fn solve(
         .collect();
     let mut direction = z.clone();
     let mut rz = dot(&residual, &z);
-    for iteration in 0..=4000 {
+    for iteration in 0..=MAX_SOLVER_ITERATIONS {
         control.check()?;
         if norm(&residual) <= tolerance {
             product(rows, metric, x, &mut ax);
@@ -291,7 +361,7 @@ fn solve(
             }
             return Ok(());
         }
-        if iteration == 4000 {
+        if iteration == MAX_SOLVER_ITERATIONS {
             return Err(InvalidData("color field did not converge"));
         }
         product(rows, metric, &direction, &mut ax);
@@ -319,7 +389,7 @@ fn solve(
     unreachable!()
 }
 fn data_equation(g: Guide) -> ([f64; 3], [f64; 2]) {
-    let [a, b, c] = g.q.map(|v| v * DATA_WEIGHT);
+    let [a, b, c] = g.q.map(|v| v * PAIR_DATA_WEIGHT);
     (
         [a + b, a + c, -a],
         [
@@ -329,12 +399,15 @@ fn data_equation(g: Guide) -> ([f64; 3], [f64; 2]) {
     )
 }
 fn direction(uv: [f64; 2], y: [f64; 3]) -> Option<[f64; 3]> {
-    if uv.iter().any(|v| !v.is_finite() || v.abs() > 30.0) {
+    if uv
+        .iter()
+        .any(|v| !v.is_finite() || v.abs() > MAX_ABS_LOG_RATIO)
+    {
         return None;
     }
     let d = [uv[0].exp(), uv[1].exp(), 1.0];
     let lum = dot3(y, d);
-    (lum.is_finite() && lum > 1e-12).then(|| d.map(|v| v / lum))
+    (lum.is_finite() && lum > MIN_DIRECTION_LUMINANCE).then(|| d.map(|v| v / lum))
 }
 
 pub(super) struct Field {
@@ -384,7 +457,7 @@ impl Field {
             let mut peak = i;
             let mut k = 0;
             while k < component.len() {
-                if k % 65536 == 0 {
+                if k % CANCEL_CHECK_INTERVAL == 0 {
                     control.check()?;
                 }
                 let n = component[k];
@@ -404,7 +477,7 @@ impl Field {
             }
         }
         for i in 0..self.nodes.len() {
-            if i % 65536 == 0 {
+            if i % CANCEL_CHECK_INTERVAL == 0 {
                 control.check()?;
             }
             for horizontal in [true, false] {
@@ -441,7 +514,7 @@ impl Field {
     }
     fn connect(&mut self, control: Control<'_>) -> crate::Result<()> {
         for i in 0..self.nodes.len() {
-            if i % 65536 == 0 {
+            if i % CANCEL_CHECK_INTERVAL == 0 {
                 control.check()?;
             }
             if i % self.cols + 1 < self.cols {
@@ -465,7 +538,7 @@ impl Field {
         let mut count = 0;
         while let Some(v) = queue.pop() {
             count += 1;
-            if count % 65536 == 0 {
+            if count % CANCEL_CHECK_INTERVAL as i32 == 0 {
                 control.check()?;
             }
             if self.nodes[v.index].distance <= v.distance {
@@ -475,7 +548,7 @@ impl Field {
             self.nodes[v.index].origin = v.origin;
             for (j, w) in self.neighbors(v.index) {
                 if j != NONE && w > 0.0 {
-                    let distance = v.distance + STEP as f64 / w.sqrt();
+                    let distance = v.distance + GRID_STEP_PIXELS as f64 / w.sqrt();
                     if distance < self.nodes[j].distance {
                         queue.push(Visit {
                             distance,
@@ -561,8 +634,8 @@ impl Field {
         stride: usize,
         control: Control<'_>,
     ) -> crate::Result<Self> {
-        let rows = (ctx.rows as usize).div_ceil(STEP);
-        let cols = (ctx.cols as usize).div_ceil(STEP);
+        let rows = (ctx.rows as usize).div_ceil(GRID_STEP_PIXELS);
+        let cols = (ctx.cols as usize).div_ceil(GRID_STEP_PIXELS);
         let mut nodes = vec![Node::default(); rows * cols];
         let neutral = unsafe { *(ctx.prior as *const [f64; 3]) };
         let y = ctx
@@ -576,12 +649,15 @@ impl Field {
                 let mut tones = 0.0;
                 let mut donors = 0.0;
                 let mut stressed = false;
-                for row in r * STEP..((r + 1) * STEP).min(ctx.rows as usize) {
-                    for col in c * STEP..((c + 1) * STEP).min(ctx.cols as usize) {
+                for row in r * GRID_STEP_PIXELS..((r + 1) * GRID_STEP_PIXELS).min(ctx.rows as usize)
+                {
+                    for col in
+                        c * GRID_STEP_PIXELS..((c + 1) * GRID_STEP_PIXELS).min(ctx.cols as usize)
+                    {
                         let measured = unsafe { ctx.measured(data, stride, row, col) };
                         let mask = model.mask(row, col);
                         let repaired = model.repaired_site(row, col);
-                        n.affected |= mask != [255; 3];
+                        n.affected |= mask != [FULL_RELIABILITY; 3];
                         let mut tone = tone_anchor::recover_severe(measured, mask, neutral, y);
                         if let Some(g) = ctx.gradient {
                             g.apply(row, col, &mut tone, measured, neutral);
@@ -591,7 +667,7 @@ impl Field {
                         } else {
                             dot3(y, measured)
                         };
-                        if target.is_finite() && target > 1e-9 {
+                        if target.is_finite() && target > MIN_CELL_LUMINANCE {
                             n.guide.tone += target.ln();
                             tones += 1.0;
                         }
@@ -602,10 +678,12 @@ impl Field {
                         }
                         count += 1.0;
                         if !repaired {
-                            stressed |= mask != [255; 3];
-                            if mask == [255; 3]
-                                && measured.iter().all(|v| v.is_finite() && *v > 0.02)
-                                && dot3(y, measured) > 1e-9
+                            stressed |= mask != [FULL_RELIABILITY; 3];
+                            if mask == [FULL_RELIABILITY; 3]
+                                && measured
+                                    .iter()
+                                    .all(|v| v.is_finite() && *v > MIN_DONOR_SIGNAL)
+                                && dot3(y, measured) > MIN_CELL_LUMINANCE
                             {
                                 n.color[0] += pair[1];
                                 n.color[1] += pair[2];
@@ -625,7 +703,7 @@ impl Field {
                     }
                     n.guide.q[k] /= count;
                 }
-                n.fixed = !stressed && donors >= 8.0 && n.guide.tone.is_finite();
+                n.fixed = !stressed && donors >= MIN_BOUNDARY_DONORS && n.guide.tone.is_finite();
                 if n.fixed {
                     n.affected = false;
                 }
@@ -668,8 +746,9 @@ impl Field {
             q,
             tone: target_y.ln(),
         };
-        let rr = (row as f64 + 0.5) / STEP as f64 - 0.5;
-        let cc = (col as f64 + 0.5) / STEP as f64 - 0.5;
+        // Half-pixel offsets align source-pixel centers with grid-cell centers.
+        let rr = (row as f64 + 0.5) / GRID_STEP_PIXELS as f64 - 0.5;
+        let cc = (col as f64 + 0.5) / GRID_STEP_PIXELS as f64 - 0.5;
         let mut sum = [0.0; 2];
         let mut total = 0.0;
         let mut distance = 0.0;
@@ -696,13 +775,14 @@ impl Field {
             }
         }
         let p = self.prior;
-        let (prior, distance) = if total > 1e-12 {
+        let (prior, distance) = if total > MIN_INTERPOLATION_WEIGHT {
             (sum.map(|v| v / total), distance / total)
         } else {
             (p.neutral, f64::INFINITY)
         };
         let proposed_prior = p.compatible_target(prior, guide);
-        let weight = 0.25 + 1.75 * (-distance / 256.0).exp();
+        let weight = NATIVE_FIELD_WEIGHT_FLOOR
+            + NATIVE_FIELD_WEIGHT_BOOST * (-distance / DONOR_DISTANCE_SCALE_PIXELS).exp();
         let proposed = p.fit(guide, proposed_prior, weight);
         let before = p.fit(guide, prior, weight);
         let retained = retained_neutral_move(before, proposed, guide);
@@ -841,7 +921,7 @@ mod tests {
                             (0..3).all(|k| {
                                 q[k].sqrt() * (ratios(fit)[k] - g.pair[k]).abs()
                                     <= q[k].sqrt() * (ratios(before)[k] - g.pair[k]).abs()
-                                        + PAIR_SCALE
+                                        + PAIR_ERROR_ALLOWANCE
                                         + tolerance
                             })
                         };
