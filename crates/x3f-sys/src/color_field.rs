@@ -9,73 +9,154 @@ use super::{tone_anchor, DngCtx, LocalRecovery};
 use crate::{Control, Error::InvalidData};
 use std::{cmp::Ordering, collections::BinaryHeap};
 
-// Behavior tuning
-// These values are empirical choices, not calibrated noise estimates. They change
-// the recovered color. Weights are equation coefficients, not mixing percentages.
+// Color behavior settings
+// These settings balance measured color, surrounding color, and a neutral
+// reference when recovering highlights. A weight controls how strongly one
+// source of evidence influences the estimate relative to the others.
+//
+// A grid cell groups nearby image pixels. Intact, unrepaired pixels with usable
+// signals can donate color. Their cell averages provide color references for
+// nearby regions needing recovery.
 
-// Evidence uses normalized, spatial-gain-corrected layer samples. Larger powers
-// discount partial reliability more strongly. Signal trust ramps from zero at
-// the start value over the transition width. The donor threshold applies to
-// every layer of an intact boundary donor.
+// Reduce the influence of partly clipped layers. Each layer's reliability is
+// between zero and one, and this power makes intermediate values smaller.
+// Larger powers reduce their influence more strongly.
 const RELIABILITY_POWER: i32 = 4;
+
+// Very dark layer measurements gain influence gradually as their signal grows.
+// Trust starts at zero at SIGNAL_TRUST_START and reaches full strength after
+// a further increase of SIGNAL_TRUST_WIDTH. Raising the start or widening the
+// transition reduces the influence of dark measurements. The camera's black
+// and white levels set the signal scale, with lens-shading correction applied.
 const SIGNAL_TRUST_START: f64 = 0.002;
 const SIGNAL_TRUST_WIDTH: f64 = 0.018;
+
+// Minimum signal in every layer of a pixel that supplies boundary color.
+// Raising this value requires brighter measurements before borrowing color.
 const MIN_DONOR_SIGNAL: f64 = 0.02;
 
-// Larger agreement scales admit greater differences. Tone scales are in stops,
-// and pair scales are natural-log layer ratios. The boundary check compares with
-// the brightest cell in the connected region. The minimum affinity cuts off
-// weak graph links, interpolation weights, and native color compatibility.
+// Brightness matching between neighboring grid cells and when reading the grid
+// at each pixel. Larger values allow more borrowing across brightness changes.
+// The value is measured in exposure stops.
 const LOCAL_TONE_SCALE_EV: f64 = 0.25;
+
+// Color matching uses ratios between sensor layers. Larger values allow more
+// borrowing despite differences in those ratios. Comparisons use natural
+// logarithms: a difference of 0.035 corresponds to about a 3.6% ratio change.
 const PAIR_AGREEMENT_SCALE: f64 = 0.035;
+
+// Check possible boundary colors against the brightest cell in each connected
+// region needing recovery. Larger values give less similar boundaries more
+// influence. Brightness is measured in stops, and color uses natural-log layer ratios.
 const BOUNDARY_TONE_SCALE_EV: f64 = 0.75;
 const BOUNDARY_PAIR_SCALE: f64 = 0.12;
+
+// Ignore connections or color proposals whose agreement weight is below this
+// value. Raising it discards more weak matches, including when reading the grid
+// and comparing its proposed color with an individual pixel's measurements.
 const MIN_AFFINITY: f64 = 1e-4;
 
-// Stronger data weight favors measured pairs in both grid and native fits.
-// Neutral weight reaches its floor with even one fully trusted pair, although
-// that pair alone does not determine hue. The extra weight grows as trust falls.
-// Keep the floor positive so an isolated cell retains a nonsingular system.
+// Give measured layer ratios more influence in both the grid calculation and
+// the final adjustment at each pixel. Increasing this weight strengthens the
+// measurements relative to surrounding color and the neutral reference.
 const PAIR_DATA_WEIGHT: f64 = 4.0;
+
+// The neutral reference is the camera's white-balanced gray. It helps estimate
+// color where measurements leave uncertainty. The most trusted layer pair sets
+// how strongly to use that reference. One fully trusted pair leaves only the
+// minimum weight, even when the third layer is missing.
+
+// Minimum pull toward neutral in the grid calculation. Keep this positive so
+// a cell with no usable color measurements still has a defined color estimate.
 const NEUTRAL_WEIGHT_FLOOR: f64 = 0.0001;
+
+// Extra pull toward neutral when no layer pair is trustworthy. This contribution
+// decreases as the most trusted pair becomes more reliable.
 const NEUTRAL_UNCERTAINTY_WEIGHT: f64 = 0.04;
+
+// Control how quickly that extra pull decreases as trust improves. Larger powers
+// reduce the extra neutral pull for partly trusted measurements.
 const NEUTRAL_UNCERTAINTY_POWER: i32 = 2;
 
-// Native fitting uses floor + boost at a donor and approaches the floor with
-// distance. Distance is affinity-weighted graph length in native-pixel units,
-// not a geometric search radius. Larger scales retain field influence farther.
+// Minimum influence of the grid's color estimate when adjusting an individual
+// pixel. This weight still applies far from pixels that supply reliable color.
 const NATIVE_FIELD_WEIGHT_FLOOR: f64 = 0.25;
+
+// Extra grid-color weight near reliable color donors. At zero distance from a
+// donor, the total weight is the floor plus this boost.
 const NATIVE_FIELD_WEIGHT_BOOST: f64 = 1.75;
+
+// Control how slowly the extra weight fades with distance from donors. Distance
+// counts pixel spacing along connected grid cells, with larger steps across
+// cells that disagree. A larger scale carries donor influence farther.
 const DONOR_DISTANCE_SCALE_PIXELS: f64 = 256.0;
 
-// Additional reliability-weighted log-ratio error allowed by the neutralward
-// guard. This allowance deliberately follows the pair-agreement scale above.
+// Allow this much additional disagreement with trusted measurements when moving
+// an estimate toward neutral. The check uses logarithmic layer ratios and gives
+// less reliable pairs more room to change. This limit follows the pair-agreement
+// setting, so changing that setting also changes the allowed disagreement here.
 const PAIR_ERROR_ALLOWANCE: f64 = PAIR_AGREEMENT_SCALE;
 
-// Grid resolution and donor support
-// Spacing controls aggregation and cost, not just color strength. The minimum
-// donor count applies per cell, so review both settings when changing resolution.
-// Keep the count positive so boundary cells contain measured color.
+// Grid size and required measurements
+
+// Width and height of each color-grid cell, in source pixels. Smaller cells give
+// finer spatial sampling and create more cells for the solver to process.
 const GRID_STEP_PIXELS: usize = 8;
+
+// Minimum number of usable, intact pixels needed for a cell to supply boundary
+// color. Keep this positive, and review it when changing cell size because the
+// number of available measurements changes with the area of each cell.
 const MIN_BOUNDARY_DONORS: f64 = 8.0;
 
-// Numerical safeguards and solver controls
-// These are validity and convergence limits, not color-strength controls.
-// Changing them can still alter accepted samples, fallbacks, or output bytes.
-const MIN_LOG_INPUT: f64 = 1e-12; // Floor layer samples before taking logarithms.
-const MIN_CELL_LUMINANCE: f64 = 1e-9; // Require positive support for guides and donors.
-const MIN_METRIC_EIGENVALUE: f64 = 1e-9; // Reject nearly singular camera metrics.
-const MAX_ABS_LOG_RATIO: f64 = 30.0; // Reject extreme directions before normalization.
-const MIN_DIRECTION_LUMINANCE: f64 = 1e-12; // Avoid division by negligible luminance.
-const MIN_INTERPOLATION_WEIGHT: f64 = 1e-12; // Require support before averaging the field.
+// Arithmetic safety and solver accuracy
+// These limits keep calculations well-defined and control how closely the
+// solver satisfies its equations. Changes need numerical checks, since they
+// can affect which estimates are accepted, which fallback is used, or whether
+// conversion succeeds.
 
-// Tolerance is absolute up to a right-hand-side norm of one, and relative above it.
+// Smallest layer value used when taking logarithms. Keeps zero and negative
+// samples from producing invalid logarithms.
+const MIN_LOG_INPUT: f64 = 1e-12;
+
+// Minimum brightness accepted when collecting grid-cell brightness and donor
+// measurements. Both calculations need a positive brightness value.
+const MIN_CELL_LUMINANCE: f64 = 1e-9;
+
+// Minimum usable response of the camera's color transform to changes in layer
+// balance. If one kind of change has too little effect on rendered color,
+// rescaling that response can amplify rounding errors. Reject that calibration.
+const MIN_METRIC_EIGENVALUE: f64 = 1e-9;
+
+// Reject color estimates with extremely large or small layer ratios. This bound
+// applies to the absolute values of their logarithms.
+const MAX_ABS_LOG_RATIO: f64 = 30.0;
+
+// Minimum brightness of a color estimate before scaling it to unit brightness.
+// That scaling divides by brightness, so a tiny value can magnify errors.
+const MIN_DIRECTION_LUMINANCE: f64 = 1e-12;
+
+// Minimum combined weight needed to average nearby grid colors. At or below
+// this limit, use the neutral reference as the starting color estimate.
+const MIN_INTERPOLATION_WEIGHT: f64 = 1e-12;
+
+// Allowed error when checking the solved equations. Smaller values demand a
+// closer solution and can require more iterations. The limit scales with the
+// largest absolute value on the equations' right-hand side when it exceeds one.
 const SOLVER_TOLERANCE: f64 = 1e-9;
-const MAX_SOLVER_ITERATIONS: i32 = 4000;
-const CANCEL_CHECK_INTERVAL: usize = 65_536; // Graph work between cancellation checks.
 
-// Representation constants, not tuning parameters.
+// Maximum number of refinement steps before conversion reports failure.
+const MAX_SOLVER_ITERATIONS: i32 = 4000;
+
+// Number of graph items processed between checks for a cancellation request.
+// Smaller values improve responsiveness at the cost of more frequent checks.
+const CANCEL_CHECK_INTERVAL: usize = 65_536;
+
+// Sensor mask and grid bookkeeping
+
+// The reliability mask uses the largest byte value for a fully usable layer.
 const FULL_RELIABILITY: u8 = u8::MAX;
+
+// Mark a missing node or neighbor with the largest index value.
 const NONE: usize = usize::MAX;
 
 fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
