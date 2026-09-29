@@ -5,7 +5,7 @@
 //! alone does not establish white: its missing third-layer relationship can
 //! equally belong to a colored surface. No fixed donor radius or scene classes.
 use super::{tone_anchor, DngCtx, LocalRecovery};
-use crate::{x3f_calc_spatial_gain, Control, Error::InvalidData};
+use crate::{Control, Error::InvalidData};
 use std::{cmp::Ordering, collections::BinaryHeap};
 const STEP: usize = 8;
 const NONE: usize = usize::MAX;
@@ -39,15 +39,18 @@ struct Guide {
     q: [f64; 3],
     tone: f64,
 }
-fn affinity(a: Guide, b: Guide) -> f64 {
+fn agreement(a: Guide, b: Guide, tone_scale: f64, pair_scale: f64) -> f64 {
     if !a.tone.is_finite() || !b.tone.is_finite() {
         return 0.0;
     }
-    let t = (a.tone - b.tone) / (0.25 * std::f64::consts::LN_2);
+    let t = (a.tone - b.tone) / (tone_scale * std::f64::consts::LN_2);
     let disagreement = (0..3)
-        .map(|k| a.q[k].min(b.q[k]) * ((a.pair[k] - b.pair[k]) / PAIR_SCALE).powi(2))
+        .map(|k| a.q[k].min(b.q[k]) * ((a.pair[k] - b.pair[k]) / pair_scale).powi(2))
         .fold(0.0_f64, f64::max);
-    let w = (-0.5 * (t * t + disagreement)).exp();
+    (-0.5 * (t * t + disagreement)).exp()
+}
+fn affinity(a: Guide, b: Guide) -> f64 {
+    let w = agreement(a, b, 0.25, PAIR_SCALE);
     if w < 1e-4 {
         0.0
     } else {
@@ -123,6 +126,11 @@ impl ColorPrior {
             metric: [a / minimum, b / minimum, c / minimum],
         })
     }
+    fn fit(self, guide: Guide, target: [f64; 2], weight: f64) -> [f64; 2] {
+        let (mut block, mut rhs) = data_equation(guide);
+        self.add(&mut block, &mut rhs, target, weight);
+        inverse(block, rhs)
+    }
     fn add(self, block: &mut [f64; 3], rhs: &mut [f64; 2], target: [f64; 2], weight: f64) {
         for k in 0..3 {
             block[k] += weight * self.metric[k];
@@ -132,14 +140,7 @@ impl ColorPrior {
     }
 }
 fn surface_agreement(a: Guide, b: Guide) -> f64 {
-    if !a.tone.is_finite() || !b.tone.is_finite() {
-        return 0.0;
-    }
-    let tone = (a.tone - b.tone) / (0.75 * std::f64::consts::LN_2);
-    let ratio = (0..3)
-        .map(|k| a.q[k].min(b.q[k]) * ((a.pair[k] - b.pair[k]) / 0.12).powi(2))
-        .fold(0.0_f64, f64::max);
-    (-0.5 * (tone * tone + ratio)).exp()
+    agreement(a, b, 0.75, 0.12)
 }
 #[derive(Clone)]
 struct Node {
@@ -189,10 +190,7 @@ impl Ord for Visit {
             .then_with(|| b.origin.cmp(&self.origin))
     }
 }
-#[derive(Clone)]
 struct Equation {
-    // One camera-calibrated metric shared by all spatial edges in this solve.
-    spatial_metric: [f64; 3],
     block: [f64; 3],
     neighbors: [usize; 4],
     weights: [f64; 4],
@@ -204,14 +202,15 @@ fn inverse(a: [f64; 3], x: [f64; 2]) -> [f64; 2] {
         (a[0] * x[1] - a[2] * x[0]) / det,
     ]
 }
-fn product(rows: &[Equation], x: &[[f64; 2]], out: &mut [[f64; 2]]) {
+// Every spatial edge uses one camera-calibrated metric, not a per-row copy.
+fn product(rows: &[Equation], metric: [f64; 3], x: &[[f64; 2]], out: &mut [[f64; 2]]) {
     for (i, e) in rows.iter().enumerate() {
         let [a, b, c] = e.block;
         out[i] = [a * x[i][0] + c * x[i][1], c * x[i][0] + b * x[i][1]];
         for k in 0..4 {
             if e.neighbors[k] != NONE {
                 let z = x[e.neighbors[k]];
-                let [a, b, c] = e.spatial_metric;
+                let [a, b, c] = metric;
                 out[i][0] -= e.weights[k] * (a * z[0] + c * z[1]);
                 out[i][1] -= e.weights[k] * (c * z[0] + b * z[1]);
             }
@@ -239,6 +238,7 @@ fn dot(a: &[[f64; 2]], b: &[[f64; 2]]) -> f64 {
 }
 fn solve(
     rows: &[Equation],
+    metric: [f64; 3],
     rhs: &[[f64; 2]],
     x: &mut [[f64; 2]],
     control: Control<'_>,
@@ -257,7 +257,7 @@ fn solve(
         return Err(InvalidData("color field RHS not finite"));
     }
     let mut ax = vec![[0.0; 2]; x.len()];
-    product(rows, x, &mut ax);
+    product(rows, metric, x, &mut ax);
     let mut residual: Vec<[f64; 2]> = rhs
         .iter()
         .zip(&ax)
@@ -273,7 +273,7 @@ fn solve(
     for iteration in 0..=4000 {
         control.check()?;
         if norm(&residual) <= tolerance {
-            product(rows, x, &mut ax);
+            product(rows, metric, x, &mut ax);
             let actual = rhs
                 .iter()
                 .flatten()
@@ -292,7 +292,7 @@ fn solve(
         if iteration == 4000 {
             return Err(InvalidData("color field did not converge"));
         }
-        product(rows, &direction, &mut ax);
+        product(rows, metric, &direction, &mut ax);
         let denominator = dot(&direction, &ax);
         if denominator <= 0.0 || !denominator.is_finite() || !rz.is_finite() {
             return Err(InvalidData("color field solver breakdown"));
@@ -533,7 +533,6 @@ impl Field {
                 }
             }
             equations.push(Equation {
-                spatial_metric: self.prior.metric,
                 block,
                 neighbors,
                 weights,
@@ -545,7 +544,7 @@ impl Field {
                 self.prior.neutral
             });
         }
-        solve(&equations, &rhs, &mut x, control)?;
+        solve(&equations, self.prior.metric, &rhs, &mut x, control)?;
         for (k, &i) in active.iter().enumerate() {
             self.nodes[i].color = x[k];
         }
@@ -577,22 +576,7 @@ impl Field {
                 let mut stressed = false;
                 for row in r * STEP..((r + 1) * STEP).min(ctx.rows as usize) {
                     for col in c * STEP..((c + 1) * STEP).min(ctx.cols as usize) {
-                        let off = row * stride + col * ctx.channels;
-                        let measured: [f64; 3] = std::array::from_fn(|ch| {
-                            let v = (data[off + ch] as f64 - ctx.black[ch])
-                                / (ctx.white[ch] as f64 - ctx.black[ch]);
-                            v * unsafe {
-                                x3f_calc_spatial_gain(
-                                    ctx.sgain,
-                                    ctx.sgain_num,
-                                    row as i32,
-                                    col as i32,
-                                    ch as i32,
-                                    ctx.rows,
-                                    ctx.cols,
-                                )
-                            }
-                        });
+                        let measured = unsafe { ctx.measured(data, stride, row, col) };
                         let mask = model.mask(row, col);
                         let repaired = model.repaired_site(row, col);
                         n.affected |= mask != [255; 3];
@@ -716,12 +700,8 @@ impl Field {
         };
         let proposed_prior = p.compatible_target(prior, guide);
         let weight = 0.25 + 1.75 * (-distance / 256.0).exp();
-        let (mut block, mut rhs) = data_equation(guide);
-        p.add(&mut block, &mut rhs, proposed_prior, weight);
-        let proposed = inverse(block, rhs);
-        let (mut old_block, mut old_rhs) = data_equation(guide);
-        p.add(&mut old_block, &mut old_rhs, prior, weight);
-        let before = inverse(old_block, old_rhs);
+        let proposed = p.fit(guide, proposed_prior, weight);
+        let before = p.fit(guide, prior, weight);
         let retained = retained_neutral_move(before, proposed, guide);
         // The fit is affine in its prior. Limit both consistently, including
         // the invalid-ray fallback. Retain an admissible proposal without interpolation.
@@ -996,25 +976,29 @@ mod tests {
     fn invalid_metric_and_nonfinite_solve_fail() {
         assert!(ColorPrior::new(P, [0.0; 9]).is_err());
         let rows = [Equation {
-            spatial_metric: [1.0, 1.0, 0.0],
             block: [f64::NAN, 1.0, 0.0],
             neighbors: [NONE; 4],
             weights: [0.0; 4],
         }];
-        assert!(solve(&rows, &[[1.0; 2]], &mut [[0.0; 2]], Control::none()).is_err());
+        assert!(solve(
+            &rows,
+            [1.0, 1.0, 0.0],
+            &[[1.0; 2]],
+            &mut [[0.0; 2]],
+            Control::none()
+        )
+        .is_err());
     }
     #[test]
     fn metric_operator_matches_dense_symmetric_positive_system() {
         let metric = [2.0, 4.0, 0.6];
         let rows = [
             Equation {
-                spatial_metric: metric,
                 block: [3.0, 5.0, 0.6],
                 neighbors: [1, NONE, NONE, NONE],
                 weights: [1.0, 0.0, 0.0, 0.0],
             },
             Equation {
-                spatial_metric: metric,
                 block: [3.0, 5.0, 0.6],
                 neighbors: [0, NONE, NONE, NONE],
                 weights: [1.0, 0.0, 0.0, 0.0],
@@ -1031,17 +1015,17 @@ mod tests {
         let expected: [f64; 4] =
             std::array::from_fn(|i| (0..4).map(|j| dense[i][j] * flat[j]).sum());
         let mut rhs = [[0.0; 2]; 2];
-        product(&rows, &truth, &mut rhs);
+        product(&rows, metric, &truth, &mut rhs);
         for (actual, expected) in rhs.iter().flatten().zip(expected) {
             assert!((actual - expected).abs() < 1e-14);
         }
         assert!(dot(&truth, &rhs) > 0.0);
         let other = [[-0.1, 0.7], [0.4, -0.8]];
         let mut mapped = [[0.0; 2]; 2];
-        product(&rows, &other, &mut mapped);
+        product(&rows, metric, &other, &mut mapped);
         assert!((dot(&truth, &mapped) - dot(&other, &rhs)).abs() < 1e-14);
         let mut result = [[0.0; 2]; 2];
-        solve(&rows, &rhs, &mut result, Control::none()).unwrap();
+        solve(&rows, metric, &rhs, &mut result, Control::none()).unwrap();
         for (a, b) in result.iter().flatten().zip(truth.iter().flatten()) {
             assert!((a - b).abs() < 1e-9);
         }
@@ -1072,11 +1056,17 @@ mod tests {
         let mut f = line(200);
         assert!(f.reconstruct(Control::new(&cancel)).is_err());
         let rows = [Equation {
-            spatial_metric: [1.0, 1.0, 0.0],
             block: [1.0, 1.0, 0.0],
             neighbors: [NONE; 4],
             weights: [0.0; 4],
         }];
-        assert!(solve(&rows, &[[1.0; 2]], &mut [[0.0; 2]], Control::new(&cancel)).is_err());
+        assert!(solve(
+            &rows,
+            [1.0, 1.0, 0.0],
+            &[[1.0; 2]],
+            &mut [[0.0; 2]],
+            Control::new(&cancel)
+        )
+        .is_err());
     }
 }

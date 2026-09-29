@@ -2736,6 +2736,30 @@ struct DngCtx<'a> {
     color_field: Option<&'a color_field::Field>,
 }
 
+impl DngCtx<'_> {
+    /// Read normalized, spatial-gain-corrected source layers while building the
+    /// immutable recovery fields. Never call this on an already encoded neighbor.
+    unsafe fn measured(&self, data: &[u16], stride: usize, row: usize, col: usize) -> [f64; 3] {
+        let off = row * stride + col * self.channels;
+        std::array::from_fn(|c| {
+            let sample =
+                (data[off + c] as f64 - self.black[c]) / (self.white[c] as f64 - self.black[c]);
+            sample
+                * unsafe {
+                    x3f_calc_spatial_gain(
+                        self.sgain,
+                        self.sgain_num,
+                        row as i32,
+                        col as i32,
+                        c as i32,
+                        self.rows,
+                        self.cols,
+                    )
+                }
+        })
+    }
+}
+
 // All pointed-to tables are immutable for the lifetime of both row passes.
 unsafe impl Send for DngCtx<'_> {}
 unsafe impl Sync for DngCtx<'_> {}
@@ -2796,9 +2820,7 @@ unsafe fn dng_evaluate_pixel(
                     target_y,
                     camera_y,
                 ) {
-                    return highlight_color::apply(
-                        measured, &tone, *prior, camera_y, direction, 1.0,
-                    );
+                    return highlight_color::apply(measured, &tone, *prior, camera_y, direction);
                 }
             }
         }

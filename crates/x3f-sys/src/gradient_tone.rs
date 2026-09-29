@@ -5,7 +5,7 @@
 //! the same data. Encoding must not read neighbors it may have overwritten.
 //! Take logarithms only of positive targets and positive layer measurements.
 use super::{tone_anchor, DngCtx, LocalRecovery};
-use crate::{x3f_calc_spatial_gain, Control, Error::InvalidData};
+use crate::{Control, Error::InvalidData};
 
 const ANCHOR: f64 = 1.0 / 64.0;
 const NONE: u32 = u32::MAX;
@@ -153,23 +153,7 @@ impl Field {
         let cols = ctx.cols as usize;
         let rows = ctx.rows as usize;
         let source = |row: usize, col: usize| {
-            let off = row * stride + col * ctx.channels;
-            let measured = std::array::from_fn(|c| {
-                let sample =
-                    (data[off + c] as f64 - ctx.black[c]) / (ctx.white[c] as f64 - ctx.black[c]);
-                sample
-                    * unsafe {
-                        x3f_calc_spatial_gain(
-                            ctx.sgain,
-                            ctx.sgain_num,
-                            row as i32,
-                            col as i32,
-                            c as i32,
-                            ctx.rows,
-                            ctx.cols,
-                        )
-                    }
-            });
+            let measured = unsafe { ctx.measured(data, stride, row, col) };
             let mask = model.mask(row, col);
             let tone = tone_anchor::recover_severe(measured, mask, neutral, y);
             let eligible = tone.available && tone.strength > 0.0;

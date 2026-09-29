@@ -177,6 +177,14 @@ layer reliability falls. This blend is applied once, not once per stage. Fully
 reliable pixels retain their normalized sensor samples before shared output
 scaling and 16-bit encoding.
 
+At native resolution, trustworthy same-pixel ratios also check the proposed field
+color. Disagreement reduces borrowed color toward calibrated neutral. A second
+guard limits that adjustment after fitting: each pair's reliability-weighted
+ratio error may increase by at most the existing agreement scale (0.035 log units),
+relative to the fit with the unadjusted field color. This keeps the neutralward
+move from discarding too much measured evidence. The bound is a conservative
+heuristic, not a calibrated noise interval or a test for white surfaces.
+
 The immutable color field is shared by headroom measurement and encoding. Its
 block-preconditioned conjugate-gradient solve checks cancellation and validates
 the true residual. Invalid calibration or nonconvergence stops conversion rather
@@ -267,9 +275,8 @@ layers from color-profile training. The mask does not say which output pixels
 changed or how much detail is recoverable.
 
 Invalid calibration, missing required layer data, and numerical solver failures
-return conversion errors. Solver, headroom, and mask diagnostics use the library's
-verbosity and log callback settings. A failed conversion must not be treated as a
-usable output.
+return conversion errors. Recovery errors use the library's verbosity and log
+callback settings. A failed conversion must not be treated as a usable output.
 
 Recovery estimates brightness and color separately, and either estimate can be
 wrong. Differences between neighboring layer measurements may come from a change
