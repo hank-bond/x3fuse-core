@@ -5,6 +5,16 @@
 //! balanced pair does not establish white. The missing third-layer relationship
 //! can also belong to a colored surface. The graph has no fixed donor radius or
 //! scene classes.
+//!
+//! # Reading order
+//!
+//! - [`Field::build`] collects measurements and builds the grid once per image.
+//! - [`Field::estimate`] reads that grid to choose a color for one pixel.
+//! - [`Field::reconstruct`] coordinates the construction work called by `build`:
+//!   connect cells, assemble their color equations, solve, and store the results.
+//!
+//! The entry points sit below the settings. Private construction methods follow,
+//! then supporting types and math helpers. Tests are at the end.
 use super::{tone_anchor, DngCtx, LocalRecovery};
 use crate::{Control, Error::InvalidData};
 use std::{cmp::Ordering, collections::BinaryHeap};
@@ -158,6 +168,412 @@ const FULL_RELIABILITY: u8 = u8::MAX;
 
 // Mark a missing node or neighbor with the largest index value.
 const NONE: usize = usize::MAX;
+
+// Entry points
+
+pub(super) struct Field {
+    rows: usize,
+    cols: usize,
+    nodes: Vec<Node>,
+    horizontal: Vec<f64>,
+    vertical: Vec<f64>,
+    prior: ColorPrior,
+}
+
+impl Field {
+    /// Build once from repaired and denoised source pixels, before encoding.
+    /// Headroom measurement and encoding read the same immutable field.
+    pub unsafe fn build(
+        ctx: &DngCtx<'_>,
+        model: &LocalRecovery,
+        data: &[u16],
+        stride: usize,
+        control: Control<'_>,
+    ) -> crate::Result<Self> {
+        let rows = (ctx.rows as usize).div_ceil(GRID_STEP_PIXELS);
+        let cols = (ctx.cols as usize).div_ceil(GRID_STEP_PIXELS);
+        let mut nodes = vec![Node::default(); rows * cols];
+        let neutral = unsafe { *(ctx.prior as *const [f64; 3]) };
+        let y = ctx
+            .camera_y
+            .ok_or(InvalidData("color field requires Merrill Y"))?;
+        for r in 0..rows {
+            control.check()?;
+            for c in 0..cols {
+                let n = &mut nodes[r * cols + c];
+                let mut count = 0.0;
+                let mut tones = 0.0;
+                let mut donors = 0.0;
+                let mut stressed = false;
+                for row in r * GRID_STEP_PIXELS..((r + 1) * GRID_STEP_PIXELS).min(ctx.rows as usize)
+                {
+                    for col in
+                        c * GRID_STEP_PIXELS..((c + 1) * GRID_STEP_PIXELS).min(ctx.cols as usize)
+                    {
+                        let measured = unsafe { ctx.measured(data, stride, row, col) };
+                        let mask = model.mask(row, col);
+                        let repaired = model.repaired_site(row, col);
+                        n.affected |= mask != [FULL_RELIABILITY; 3];
+                        let mut tone = tone_anchor::recover_severe(measured, mask, neutral, y);
+                        if let Some(g) = ctx.gradient {
+                            g.apply(row, col, &mut tone, measured, neutral);
+                        }
+                        let target = if tone.available {
+                            tone.amplitude * dot3(y, neutral)
+                        } else {
+                            dot3(y, measured)
+                        };
+                        if target.is_finite() && target > MIN_CELL_LUMINANCE {
+                            n.guide.tone += target.ln();
+                            tones += 1.0;
+                        }
+                        let (pair, q) = evidence(measured, mask, repaired);
+                        for k in 0..3 {
+                            n.guide.pair[k] += q[k] * pair[k];
+                            n.guide.q[k] += q[k];
+                        }
+                        count += 1.0;
+                        if !repaired {
+                            stressed |= mask != [FULL_RELIABILITY; 3];
+                            if mask == [FULL_RELIABILITY; 3]
+                                && measured
+                                    .iter()
+                                    .all(|v| v.is_finite() && *v > MIN_DONOR_SIGNAL)
+                                && dot3(y, measured) > MIN_CELL_LUMINANCE
+                            {
+                                n.color[0] += pair[1];
+                                n.color[1] += pair[2];
+                                donors += 1.0;
+                            }
+                        }
+                    }
+                }
+                n.guide.tone = if tones > 0.0 {
+                    n.guide.tone / tones
+                } else {
+                    f64::NAN
+                };
+                for k in 0..3 {
+                    if n.guide.q[k] > 0.0 {
+                        n.guide.pair[k] /= n.guide.q[k];
+                    }
+                    n.guide.q[k] /= count;
+                }
+                n.fixed = !stressed && donors >= MIN_BOUNDARY_DONORS && n.guide.tone.is_finite();
+                if n.fixed {
+                    n.affected = false;
+                }
+                if donors > 0.0 {
+                    n.color = n.color.map(|v| v / donors);
+                }
+            }
+        }
+        let size = nodes.len();
+        let mut result = Self {
+            rows,
+            cols,
+            nodes,
+            horizontal: vec![0.0; size],
+            vertical: vec![0.0; size],
+            prior: ColorPrior::new(neutral, unsafe { *(ctx.conv_matrix as *const [f64; 9]) })?,
+        };
+        result.reconstruct(control)?;
+        Ok(result)
+    }
+
+    /// Estimate color without changing brightness. Repaired pixels and single
+    /// surviving layers cannot supply independent ratios. Normalize the returned
+    /// direction to unit luminance using the camera calibration.
+    pub fn estimate(
+        &self,
+        row: usize,
+        col: usize,
+        measured: [f64; 3],
+        mask: [u8; 3],
+        repaired: bool,
+        target_y: f64,
+        y: [f64; 3],
+    ) -> Option<[f64; 3]> {
+        if !target_y.is_finite() || target_y <= 0.0 {
+            return None;
+        }
+        let (pair, q) = evidence(measured, mask, repaired);
+        let guide = Guide {
+            pair,
+            q,
+            tone: target_y.ln(),
+        };
+        // Half-pixel offsets align source-pixel centers with grid-cell centers.
+        let rr = (row as f64 + 0.5) / GRID_STEP_PIXELS as f64 - 0.5;
+        let cc = (col as f64 + 0.5) / GRID_STEP_PIXELS as f64 - 0.5;
+        let mut sum = [0.0; 2];
+        let mut total = 0.0;
+        let mut distance = 0.0;
+        for r in rr.floor() as isize..=rr.floor() as isize + 1 {
+            for c in cc.floor() as isize..=cc.floor() as isize + 1 {
+                if r < 0 || c < 0 || r as usize >= self.rows || c as usize >= self.cols {
+                    continue;
+                }
+                let n = &self.nodes[r as usize * self.cols + c as usize];
+                if !n.distance.is_finite() && !n.affected {
+                    continue;
+                }
+                let w = (1.0 - (rr - r as f64).abs())
+                    * (1.0 - (cc - c as f64).abs())
+                    * affinity(guide, n.guide);
+                if w <= 0.0 {
+                    continue;
+                }
+                total += w;
+                for (ch, value) in sum.iter_mut().enumerate() {
+                    *value += w * n.color[ch];
+                }
+                distance += w * n.distance;
+            }
+        }
+        let p = self.prior;
+        let (prior, distance) = if total > MIN_INTERPOLATION_WEIGHT {
+            (sum.map(|v| v / total), distance / total)
+        } else {
+            (p.neutral, f64::INFINITY)
+        };
+        let proposed_prior = p.compatible_target(prior, guide);
+        let weight = NATIVE_FIELD_WEIGHT_FLOOR
+            + NATIVE_FIELD_WEIGHT_BOOST * (-distance / DONOR_DISTANCE_SCALE_PIXELS).exp();
+        let proposed = p.fit(guide, proposed_prior, weight);
+        let before = p.fit(guide, prior, weight);
+        let retained = retained_neutral_move(before, proposed, guide);
+        // The fit is affine in its prior, so limit both by the same fraction.
+        // Preserve the fallback direction and skip interpolation for an admissible proposal.
+        let (fit, prior) = if retained == 1.0 {
+            (proposed, proposed_prior)
+        } else {
+            (
+                std::array::from_fn(|k| before[k] + retained * (proposed[k] - before[k])),
+                std::array::from_fn(|k| prior[k] + retained * (proposed_prior[k] - prior[k])),
+            )
+        };
+        direction(fit, y)
+            .or_else(|| direction(prior, y))
+            .or_else(|| direction(p.neutral, y))
+    }
+}
+
+// Field construction
+
+impl Field {
+    fn reconstruct(&mut self, control: Control<'_>) -> crate::Result<()> {
+        self.connect(control)?;
+        let mut index = vec![NONE; self.nodes.len()];
+        let mut active = Vec::new();
+        for (i, n) in self.nodes.iter().enumerate() {
+            if !n.fixed && n.affected {
+                index[i] = active.len();
+                active.push(i);
+            }
+        }
+        let mut equations = Vec::with_capacity(active.len());
+        let mut rhs = Vec::with_capacity(active.len());
+        let mut x = Vec::with_capacity(active.len());
+        for &i in &active {
+            let n = &self.nodes[i];
+            let (mut block, mut target) = data_equation(n.guide);
+            self.prior.add(
+                &mut block,
+                &mut target,
+                self.prior.neutral,
+                neutral_weight(n.guide),
+            );
+            let mut neighbors = [NONE; 4];
+            let mut weights = [0.0; 4];
+            for (k, (j, w)) in self.neighbors(i).into_iter().enumerate() {
+                if j == NONE || w == 0.0 {
+                    continue;
+                }
+                // Measure spatial differences in the same calibrated geometry
+                // as the neutral prior, including fixed-boundary contributions.
+                self.prior.add(
+                    &mut block,
+                    &mut target,
+                    if self.nodes[j].fixed {
+                        self.nodes[j].color
+                    } else {
+                        [0.0; 2]
+                    },
+                    w,
+                );
+                if !self.nodes[j].fixed {
+                    assert_ne!(index[j], NONE);
+                    neighbors[k] = index[j];
+                    weights[k] = w;
+                }
+            }
+            equations.push(Equation {
+                block,
+                neighbors,
+                weights,
+            });
+            rhs.push(target);
+            x.push(if n.origin != NONE {
+                self.nodes[n.origin].color
+            } else {
+                self.prior.neutral
+            });
+        }
+        solve(&equations, self.prior.metric, &rhs, &mut x, control)?;
+        for (k, &i) in active.iter().enumerate() {
+            self.nodes[i].color = x[k];
+        }
+        Ok(())
+    }
+
+    fn connect(&mut self, control: Control<'_>) -> crate::Result<()> {
+        for i in 0..self.nodes.len() {
+            if i % CANCEL_CHECK_INTERVAL == 0 {
+                control.check()?;
+            }
+            if i % self.cols + 1 < self.cols {
+                self.horizontal[i] = affinity(self.nodes[i].guide, self.nodes[i + 1].guide);
+            }
+            if i / self.cols + 1 < self.rows {
+                self.vertical[i] = affinity(self.nodes[i].guide, self.nodes[i + self.cols].guide);
+            }
+        }
+        self.condition_boundaries(control)?;
+        let mut queue = BinaryHeap::new();
+        for (i, n) in self.nodes.iter().enumerate() {
+            if n.fixed {
+                queue.push(Visit {
+                    distance: 0.0,
+                    index: i,
+                    origin: i,
+                });
+            }
+        }
+        let mut count = 0;
+        while let Some(v) = queue.pop() {
+            count += 1;
+            if count % CANCEL_CHECK_INTERVAL as i32 == 0 {
+                control.check()?;
+            }
+            if self.nodes[v.index].distance <= v.distance {
+                continue;
+            }
+            self.nodes[v.index].distance = v.distance;
+            self.nodes[v.index].origin = v.origin;
+            for (j, w) in self.neighbors(v.index) {
+                if j != NONE && w > 0.0 {
+                    let distance = v.distance + GRID_STEP_PIXELS as f64 / w.sqrt();
+                    if distance < self.nodes[j].distance {
+                        queue.push(Visit {
+                            distance,
+                            index: j,
+                            origin: v.origin,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn condition_boundaries(&mut self, control: Control<'_>) -> crate::Result<()> {
+        let mut seen = vec![false; self.nodes.len()];
+        for i in 0..self.nodes.len() {
+            if seen[i] || !self.nodes[i].affected {
+                continue;
+            }
+            control.check()?;
+            let mut component = vec![i];
+            seen[i] = true;
+            let mut peak = i;
+            let mut k = 0;
+            while k < component.len() {
+                if k % CANCEL_CHECK_INTERVAL == 0 {
+                    control.check()?;
+                }
+                let n = component[k];
+                k += 1;
+                if self.nodes[n].guide.tone > self.nodes[peak].guide.tone {
+                    peak = n;
+                }
+                for (j, w) in self.neighbors(n) {
+                    if j != NONE && w > 0.0 && self.nodes[j].affected && !seen[j] {
+                        seen[j] = true;
+                        component.push(j);
+                    }
+                }
+            }
+            for n in component {
+                self.nodes[n].region = peak;
+            }
+        }
+        for i in 0..self.nodes.len() {
+            if i % CANCEL_CHECK_INTERVAL == 0 {
+                control.check()?;
+            }
+            for horizontal in [true, false] {
+                let j = if horizontal {
+                    if i % self.cols + 1 >= self.cols {
+                        continue;
+                    }
+                    i + 1
+                } else {
+                    if i / self.cols + 1 >= self.rows {
+                        continue;
+                    }
+                    i + self.cols
+                };
+                let a = &self.nodes[i];
+                let b = &self.nodes[j];
+                let gate = if (!a.fixed && !a.affected) || (!b.fixed && !b.affected) {
+                    0.0
+                } else if a.affected && b.fixed {
+                    surface_agreement(self.nodes[a.region].guide, b.guide)
+                } else if b.affected && a.fixed {
+                    surface_agreement(self.nodes[b.region].guide, a.guide)
+                } else {
+                    1.0
+                };
+                if horizontal {
+                    self.horizontal[i] *= gate;
+                } else {
+                    self.vertical[i] *= gate;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn neighbors(&self, i: usize) -> [(usize, f64); 4] {
+        let r = i / self.cols;
+        let c = i % self.cols;
+        [
+            if r > 0 {
+                (i - self.cols, self.vertical[i - self.cols])
+            } else {
+                (NONE, 0.0)
+            },
+            if c > 0 {
+                (i - 1, self.horizontal[i - 1])
+            } else {
+                (NONE, 0.0)
+            },
+            if r + 1 < self.rows {
+                (i + self.cols, self.vertical[i])
+            } else {
+                (NONE, 0.0)
+            },
+            if c + 1 < self.cols {
+                (i + 1, self.horizontal[i])
+            } else {
+                (NONE, 0.0)
+            },
+        ]
+    }
+}
+
+// Supporting types and math helpers
 
 fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
     a.into_iter().zip(b).map(|(x, y)| x * y).sum()
@@ -489,398 +905,6 @@ fn direction(uv: [f64; 2], y: [f64; 3]) -> Option<[f64; 3]> {
     let d = [uv[0].exp(), uv[1].exp(), 1.0];
     let lum = dot3(y, d);
     (lum.is_finite() && lum > MIN_DIRECTION_LUMINANCE).then(|| d.map(|v| v / lum))
-}
-
-pub(super) struct Field {
-    rows: usize,
-    cols: usize,
-    nodes: Vec<Node>,
-    horizontal: Vec<f64>,
-    vertical: Vec<f64>,
-    prior: ColorPrior,
-}
-impl Field {
-    fn neighbors(&self, i: usize) -> [(usize, f64); 4] {
-        let r = i / self.cols;
-        let c = i % self.cols;
-        [
-            if r > 0 {
-                (i - self.cols, self.vertical[i - self.cols])
-            } else {
-                (NONE, 0.0)
-            },
-            if c > 0 {
-                (i - 1, self.horizontal[i - 1])
-            } else {
-                (NONE, 0.0)
-            },
-            if r + 1 < self.rows {
-                (i + self.cols, self.vertical[i])
-            } else {
-                (NONE, 0.0)
-            },
-            if c + 1 < self.cols {
-                (i + 1, self.horizontal[i])
-            } else {
-                (NONE, 0.0)
-            },
-        ]
-    }
-    fn condition_boundaries(&mut self, control: Control<'_>) -> crate::Result<()> {
-        let mut seen = vec![false; self.nodes.len()];
-        for i in 0..self.nodes.len() {
-            if seen[i] || !self.nodes[i].affected {
-                continue;
-            }
-            control.check()?;
-            let mut component = vec![i];
-            seen[i] = true;
-            let mut peak = i;
-            let mut k = 0;
-            while k < component.len() {
-                if k % CANCEL_CHECK_INTERVAL == 0 {
-                    control.check()?;
-                }
-                let n = component[k];
-                k += 1;
-                if self.nodes[n].guide.tone > self.nodes[peak].guide.tone {
-                    peak = n;
-                }
-                for (j, w) in self.neighbors(n) {
-                    if j != NONE && w > 0.0 && self.nodes[j].affected && !seen[j] {
-                        seen[j] = true;
-                        component.push(j);
-                    }
-                }
-            }
-            for n in component {
-                self.nodes[n].region = peak;
-            }
-        }
-        for i in 0..self.nodes.len() {
-            if i % CANCEL_CHECK_INTERVAL == 0 {
-                control.check()?;
-            }
-            for horizontal in [true, false] {
-                let j = if horizontal {
-                    if i % self.cols + 1 >= self.cols {
-                        continue;
-                    }
-                    i + 1
-                } else {
-                    if i / self.cols + 1 >= self.rows {
-                        continue;
-                    }
-                    i + self.cols
-                };
-                let a = &self.nodes[i];
-                let b = &self.nodes[j];
-                let gate = if (!a.fixed && !a.affected) || (!b.fixed && !b.affected) {
-                    0.0
-                } else if a.affected && b.fixed {
-                    surface_agreement(self.nodes[a.region].guide, b.guide)
-                } else if b.affected && a.fixed {
-                    surface_agreement(self.nodes[b.region].guide, a.guide)
-                } else {
-                    1.0
-                };
-                if horizontal {
-                    self.horizontal[i] *= gate;
-                } else {
-                    self.vertical[i] *= gate;
-                }
-            }
-        }
-        Ok(())
-    }
-    fn connect(&mut self, control: Control<'_>) -> crate::Result<()> {
-        for i in 0..self.nodes.len() {
-            if i % CANCEL_CHECK_INTERVAL == 0 {
-                control.check()?;
-            }
-            if i % self.cols + 1 < self.cols {
-                self.horizontal[i] = affinity(self.nodes[i].guide, self.nodes[i + 1].guide);
-            }
-            if i / self.cols + 1 < self.rows {
-                self.vertical[i] = affinity(self.nodes[i].guide, self.nodes[i + self.cols].guide);
-            }
-        }
-        self.condition_boundaries(control)?;
-        let mut queue = BinaryHeap::new();
-        for (i, n) in self.nodes.iter().enumerate() {
-            if n.fixed {
-                queue.push(Visit {
-                    distance: 0.0,
-                    index: i,
-                    origin: i,
-                });
-            }
-        }
-        let mut count = 0;
-        while let Some(v) = queue.pop() {
-            count += 1;
-            if count % CANCEL_CHECK_INTERVAL as i32 == 0 {
-                control.check()?;
-            }
-            if self.nodes[v.index].distance <= v.distance {
-                continue;
-            }
-            self.nodes[v.index].distance = v.distance;
-            self.nodes[v.index].origin = v.origin;
-            for (j, w) in self.neighbors(v.index) {
-                if j != NONE && w > 0.0 {
-                    let distance = v.distance + GRID_STEP_PIXELS as f64 / w.sqrt();
-                    if distance < self.nodes[j].distance {
-                        queue.push(Visit {
-                            distance,
-                            index: j,
-                            origin: v.origin,
-                        });
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-    fn reconstruct(&mut self, control: Control<'_>) -> crate::Result<()> {
-        self.connect(control)?;
-        let mut index = vec![NONE; self.nodes.len()];
-        let mut active = Vec::new();
-        for (i, n) in self.nodes.iter().enumerate() {
-            if !n.fixed && n.affected {
-                index[i] = active.len();
-                active.push(i);
-            }
-        }
-        let mut equations = Vec::with_capacity(active.len());
-        let mut rhs = Vec::with_capacity(active.len());
-        let mut x = Vec::with_capacity(active.len());
-        for &i in &active {
-            let n = &self.nodes[i];
-            let (mut block, mut target) = data_equation(n.guide);
-            self.prior.add(
-                &mut block,
-                &mut target,
-                self.prior.neutral,
-                neutral_weight(n.guide),
-            );
-            let mut neighbors = [NONE; 4];
-            let mut weights = [0.0; 4];
-            for (k, (j, w)) in self.neighbors(i).into_iter().enumerate() {
-                if j == NONE || w == 0.0 {
-                    continue;
-                }
-                // Measure spatial differences in the same calibrated geometry
-                // as the neutral prior, including fixed-boundary contributions.
-                self.prior.add(
-                    &mut block,
-                    &mut target,
-                    if self.nodes[j].fixed {
-                        self.nodes[j].color
-                    } else {
-                        [0.0; 2]
-                    },
-                    w,
-                );
-                if !self.nodes[j].fixed {
-                    assert_ne!(index[j], NONE);
-                    neighbors[k] = index[j];
-                    weights[k] = w;
-                }
-            }
-            equations.push(Equation {
-                block,
-                neighbors,
-                weights,
-            });
-            rhs.push(target);
-            x.push(if n.origin != NONE {
-                self.nodes[n.origin].color
-            } else {
-                self.prior.neutral
-            });
-        }
-        solve(&equations, self.prior.metric, &rhs, &mut x, control)?;
-        for (k, &i) in active.iter().enumerate() {
-            self.nodes[i].color = x[k];
-        }
-        Ok(())
-    }
-    /// Build once from repaired and denoised source pixels, before encoding.
-    /// Headroom measurement and encoding read the same immutable field.
-    pub unsafe fn build(
-        ctx: &DngCtx<'_>,
-        model: &LocalRecovery,
-        data: &[u16],
-        stride: usize,
-        control: Control<'_>,
-    ) -> crate::Result<Self> {
-        let rows = (ctx.rows as usize).div_ceil(GRID_STEP_PIXELS);
-        let cols = (ctx.cols as usize).div_ceil(GRID_STEP_PIXELS);
-        let mut nodes = vec![Node::default(); rows * cols];
-        let neutral = unsafe { *(ctx.prior as *const [f64; 3]) };
-        let y = ctx
-            .camera_y
-            .ok_or(InvalidData("color field requires Merrill Y"))?;
-        for r in 0..rows {
-            control.check()?;
-            for c in 0..cols {
-                let n = &mut nodes[r * cols + c];
-                let mut count = 0.0;
-                let mut tones = 0.0;
-                let mut donors = 0.0;
-                let mut stressed = false;
-                for row in r * GRID_STEP_PIXELS..((r + 1) * GRID_STEP_PIXELS).min(ctx.rows as usize)
-                {
-                    for col in
-                        c * GRID_STEP_PIXELS..((c + 1) * GRID_STEP_PIXELS).min(ctx.cols as usize)
-                    {
-                        let measured = unsafe { ctx.measured(data, stride, row, col) };
-                        let mask = model.mask(row, col);
-                        let repaired = model.repaired_site(row, col);
-                        n.affected |= mask != [FULL_RELIABILITY; 3];
-                        let mut tone = tone_anchor::recover_severe(measured, mask, neutral, y);
-                        if let Some(g) = ctx.gradient {
-                            g.apply(row, col, &mut tone, measured, neutral);
-                        }
-                        let target = if tone.available {
-                            tone.amplitude * dot3(y, neutral)
-                        } else {
-                            dot3(y, measured)
-                        };
-                        if target.is_finite() && target > MIN_CELL_LUMINANCE {
-                            n.guide.tone += target.ln();
-                            tones += 1.0;
-                        }
-                        let (pair, q) = evidence(measured, mask, repaired);
-                        for k in 0..3 {
-                            n.guide.pair[k] += q[k] * pair[k];
-                            n.guide.q[k] += q[k];
-                        }
-                        count += 1.0;
-                        if !repaired {
-                            stressed |= mask != [FULL_RELIABILITY; 3];
-                            if mask == [FULL_RELIABILITY; 3]
-                                && measured
-                                    .iter()
-                                    .all(|v| v.is_finite() && *v > MIN_DONOR_SIGNAL)
-                                && dot3(y, measured) > MIN_CELL_LUMINANCE
-                            {
-                                n.color[0] += pair[1];
-                                n.color[1] += pair[2];
-                                donors += 1.0;
-                            }
-                        }
-                    }
-                }
-                n.guide.tone = if tones > 0.0 {
-                    n.guide.tone / tones
-                } else {
-                    f64::NAN
-                };
-                for k in 0..3 {
-                    if n.guide.q[k] > 0.0 {
-                        n.guide.pair[k] /= n.guide.q[k];
-                    }
-                    n.guide.q[k] /= count;
-                }
-                n.fixed = !stressed && donors >= MIN_BOUNDARY_DONORS && n.guide.tone.is_finite();
-                if n.fixed {
-                    n.affected = false;
-                }
-                if donors > 0.0 {
-                    n.color = n.color.map(|v| v / donors);
-                }
-            }
-        }
-        let size = nodes.len();
-        let mut result = Self {
-            rows,
-            cols,
-            nodes,
-            horizontal: vec![0.0; size],
-            vertical: vec![0.0; size],
-            prior: ColorPrior::new(neutral, unsafe { *(ctx.conv_matrix as *const [f64; 9]) })?,
-        };
-        result.reconstruct(control)?;
-        Ok(result)
-    }
-    /// Estimate color without changing brightness. Repaired pixels and single
-    /// surviving layers cannot supply independent ratios. Normalize the returned
-    /// direction to unit luminance using the camera calibration.
-    pub fn estimate(
-        &self,
-        row: usize,
-        col: usize,
-        measured: [f64; 3],
-        mask: [u8; 3],
-        repaired: bool,
-        target_y: f64,
-        y: [f64; 3],
-    ) -> Option<[f64; 3]> {
-        if !target_y.is_finite() || target_y <= 0.0 {
-            return None;
-        }
-        let (pair, q) = evidence(measured, mask, repaired);
-        let guide = Guide {
-            pair,
-            q,
-            tone: target_y.ln(),
-        };
-        // Half-pixel offsets align source-pixel centers with grid-cell centers.
-        let rr = (row as f64 + 0.5) / GRID_STEP_PIXELS as f64 - 0.5;
-        let cc = (col as f64 + 0.5) / GRID_STEP_PIXELS as f64 - 0.5;
-        let mut sum = [0.0; 2];
-        let mut total = 0.0;
-        let mut distance = 0.0;
-        for r in rr.floor() as isize..=rr.floor() as isize + 1 {
-            for c in cc.floor() as isize..=cc.floor() as isize + 1 {
-                if r < 0 || c < 0 || r as usize >= self.rows || c as usize >= self.cols {
-                    continue;
-                }
-                let n = &self.nodes[r as usize * self.cols + c as usize];
-                if !n.distance.is_finite() && !n.affected {
-                    continue;
-                }
-                let w = (1.0 - (rr - r as f64).abs())
-                    * (1.0 - (cc - c as f64).abs())
-                    * affinity(guide, n.guide);
-                if w <= 0.0 {
-                    continue;
-                }
-                total += w;
-                for (ch, value) in sum.iter_mut().enumerate() {
-                    *value += w * n.color[ch];
-                }
-                distance += w * n.distance;
-            }
-        }
-        let p = self.prior;
-        let (prior, distance) = if total > MIN_INTERPOLATION_WEIGHT {
-            (sum.map(|v| v / total), distance / total)
-        } else {
-            (p.neutral, f64::INFINITY)
-        };
-        let proposed_prior = p.compatible_target(prior, guide);
-        let weight = NATIVE_FIELD_WEIGHT_FLOOR
-            + NATIVE_FIELD_WEIGHT_BOOST * (-distance / DONOR_DISTANCE_SCALE_PIXELS).exp();
-        let proposed = p.fit(guide, proposed_prior, weight);
-        let before = p.fit(guide, prior, weight);
-        let retained = retained_neutral_move(before, proposed, guide);
-        // The fit is affine in its prior, so limit both by the same fraction.
-        // Preserve the fallback direction and skip interpolation for an admissible proposal.
-        let (fit, prior) = if retained == 1.0 {
-            (proposed, proposed_prior)
-        } else {
-            (
-                std::array::from_fn(|k| before[k] + retained * (proposed[k] - before[k])),
-                std::array::from_fn(|k| prior[k] + retained * (proposed_prior[k] - prior[k])),
-            )
-        };
-        direction(fit, y)
-            .or_else(|| direction(prior, y))
-            .or_else(|| direction(p.neutral, y))
-    }
 }
 
 #[cfg(test)]
