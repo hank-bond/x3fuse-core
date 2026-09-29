@@ -27,9 +27,8 @@ pub struct SensorReliability {
     /// Nonempty, validated Merrill SatMaps, in bottom/middle/top bit order.
     /// Preserve this status when cropping the accompanying reliability data.
     pub camera_map_channels: u8,
-    /// Camera-marked repair sites excluded from Merrill color donors.
-    /// Separate from layer clipping reliability: interpolation must not turn
-    /// replacement samples into independent, fully reliable color evidence.
+    /// Camera-marked repair sites that cannot supply independent color evidence.
+    /// Track these sites separately from layer clipping reliability.
     pub repair_marked: Vec<bool>,
 }
 

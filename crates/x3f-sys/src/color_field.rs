@@ -1,9 +1,10 @@
-//! Continuous Merrill highlight color, independent of the frozen tone solve.
+//! Reconstruct Merrill highlight color without changing reconstructed brightness.
 //!
-//! An eight-pixel graph combines intact boundaries and reliable same-site layer
-//! ratios. Missing color has a soft calibrated-neutral prior. A balanced pair
-//! alone does not establish white: its missing third-layer relationship can
-//! equally belong to a colored surface. No fixed donor radius or scene classes.
+//! An 8-pixel graph combines intact boundary color and reliable same-pixel layer
+//! ratios. A calibrated-neutral prior supplies missing color constraints, but a
+//! balanced pair does not establish white. The missing third-layer relationship
+//! can also belong to a colored surface. The graph has no fixed donor radius or
+//! scene classes.
 use super::{tone_anchor, DngCtx, LocalRecovery};
 use crate::{Control, Error::InvalidData};
 use std::{cmp::Ordering, collections::BinaryHeap};
@@ -57,9 +58,9 @@ fn affinity(a: Guide, b: Guide) -> f64 {
         w
     }
 }
-/// Limit the neutralward adjustment, not the field or the evidence weights.
-/// The bound allows one existing agreement scale of additional weighted error;
-/// this is a conservative heuristic, not a calibrated noise confidence interval.
+/// Limit the neutralward adjustment without changing the field or evidence weights.
+/// Allow one pair-agreement scale of additional weighted ratio error.
+/// This heuristic does not define a calibrated noise interval.
 fn retained_neutral_move(before: [f64; 2], proposed: [f64; 2], g: Guide) -> f64 {
     let ratios = |v: [f64; 2]| [v[0] - v[1], v[0], v[1]];
     let a = ratios(before);
@@ -90,9 +91,9 @@ struct ColorPrior {
     metric: [f64; 3],
 }
 impl ColorPrior {
-    /// A solved field can disagree with native evidence even when its coarse
-    /// guide averages agree. Borrow only the compatible part of that proposal;
-    /// keep the existing uncertainty reference, not a semantic white decision.
+    /// Coarse averages can hide disagreement with the target pixel's measurements.
+    /// Reduce the proposal toward calibrated neutral when trusted ratios disagree.
+    /// This constraint does not classify the pixel as white.
     fn compatible_target(self, field: [f64; 2], guide: Guide) -> [f64; 2] {
         let proposal = Guide {
             pair: [field[0] - field[1], field[0], field[1]],
@@ -110,8 +111,8 @@ impl ColorPrior {
         {
             return Err(InvalidData("invalid neutral color metric"));
         }
-        // Jacobian of log(R/G), log(B/G) at calibrated neutral. The raw
-        // layer axes are not perceptually orthogonal; equal BMT is not white.
+        // Use the Jacobian of log(R/G) and log(B/G) at calibrated neutral.
+        // Equal sensor-layer values do not imply neutral rendered color.
         let j: [[f64; 2]; 2] = [0, 2]
             .map(|r| std::array::from_fn(|c| p[c] * (m[3 * r + c] / rgb[r] - m[3 + c] / rgb[1])));
         let a = j[0][0] * j[0][0] + j[1][0] * j[1][0];
@@ -202,7 +203,8 @@ fn inverse(a: [f64; 3], x: [f64; 2]) -> [f64; 2] {
         (a[0] * x[1] - a[2] * x[0]) / det,
     ]
 }
-// Every spatial edge uses one camera-calibrated metric, not a per-row copy.
+// Use the neutral prior's metric for spatial edges so that both constraints
+// measure color differences in the same geometry.
 fn product(rows: &[Equation], metric: [f64; 3], x: &[[f64; 2]], out: &mut [[f64; 2]]) {
     for (i, e) in rows.iter().enumerate() {
         let [a, b, c] = e.block;
@@ -550,8 +552,8 @@ impl Field {
         }
         Ok(())
     }
-    /// Read-only access to the same post-repair, post-denoise source as the
-    /// headroom/encoding passes. Build once before either pass overwrites pixels.
+    /// Build once from repaired and denoised source pixels, before encoding.
+    /// Headroom measurement and encoding read the same immutable field.
     pub unsafe fn build(
         ctx: &DngCtx<'_>,
         model: &LocalRecovery,
@@ -644,8 +646,9 @@ impl Field {
         result.reconstruct(control)?;
         Ok(result)
     }
-    /// Estimate color only. Repaired sites and a single surviving layer supply
-    /// no independent ratio. Directions are normalized to camera-PCS Y = 1.
+    /// Estimate color without changing brightness. Repaired pixels and single
+    /// surviving layers cannot supply independent ratios. Normalize the returned
+    /// direction to unit luminance using the camera calibration.
     pub fn estimate(
         &self,
         row: usize,
@@ -703,8 +706,8 @@ impl Field {
         let proposed = p.fit(guide, proposed_prior, weight);
         let before = p.fit(guide, prior, weight);
         let retained = retained_neutral_move(before, proposed, guide);
-        // The fit is affine in its prior. Limit both consistently, including
-        // the invalid-ray fallback. Retain an admissible proposal without interpolation.
+        // The fit is affine in its prior, so limit both by the same fraction.
+        // Preserve the fallback direction and skip interpolation for an admissible proposal.
         let (fit, prior) = if retained == 1.0 {
             (proposed, proposed_prior)
         } else {
@@ -790,7 +793,7 @@ mod tests {
         };
         assert_eq!(retained_neutral_move([0.04, 0.0], [0.041, 0.0], g), 1.0);
         assert_eq!(retained_neutral_move([0.04, 0.0], [0.01, 0.0], g), 1.0);
-        // A move along the unobserved direction cannot be vetoed by B/M.
+        // The measured B/M ratio does not constrain movement along this direction.
         assert_eq!(retained_neutral_move([0.04, 0.0], [1.04, 1.0], g), 1.0);
         g.q = [0.0; 3];
         assert_eq!(retained_neutral_move([0.04, 0.0], [-0.8, 0.5], g), 1.0);

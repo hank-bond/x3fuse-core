@@ -2824,7 +2824,7 @@ unsafe fn dng_evaluate_pixel(
                 }
             }
         }
-        // Unsupported/invalid color retains the fixed tone, not another donor path.
+        // Keep the reconstructed tone if no valid color direction is available.
         return tone.samples;
     }
     let mut samples = original;
@@ -3381,7 +3381,7 @@ unsafe fn apply_highlight_clip_dng_impl(
         } {
             Ok(field) => Some(field),
             Err(error) => {
-                // Match gradient-field failure cleanup before leaving the pipeline.
+                // This conversion owns these allocations even when field construction fails.
                 unsafe {
                     x3f_cleanup_spatial_gain(sgain.as_mut_ptr(), sgain_num);
                     libc::free(sat_map.cast());
@@ -4740,8 +4740,8 @@ mod tests {
             std::fs::remove_file(path).unwrap();
             report_dng_recovery_error("test logging failure");
             let mut messages = MESSAGES.lock().unwrap();
-            // Successful field/mask operations no longer emit research statistics.
-            // Failures still reach the embedding callback at every verbosity.
+            // Successful field construction and mask export produce no log messages.
+            // Recovery errors reach the embedding callback at every verbosity.
             assert_eq!(messages.len(), 1);
             assert_eq!(
                 messages.last().unwrap(),

@@ -134,63 +134,64 @@ silently switch to another reconstruction method.
 
 ### 3. Add highlight color
 
-Color is reconstructed as a continuous field of log layer ratios on an
-eight-pixel grid. Intact boundaries supply color, not brightness or texture.
-Reliable pairs of layers at the same pixel also constrain the field. One surviving
-layer cannot determine hue. A balanced pair does not establish white, because the
-missing third layer could distinguish a colored surface from a neutral one.
+The color stage reconstructs a *color field*, a grid of logarithmic layer ratios
+with 8-pixel spacing. Intact pixels supply color ratios at the boundaries of
+affected regions. These pixels are the color *donors*. Reliable pairs of layers
+at the same pixel also constrain the field. One surviving layer cannot determine
+hue. A balanced pair does not establish white, because the missing third layer
+could distinguish a colored surface from a neutral one.
 
-The field connects affected regions through agreement in reconstructed tone and
-surviving ratios. There is no fixed donor search radius. Boundary influence is
-also checked against the peak reconstructed tone and surviving ratios of the
-connected region, so a gradual path into a much darker surface does not suffice.
-Unaffected low-signal cells cannot bridge unrelated donors. These are evidence
-gates, not semantic guarantees that connected pixels belong to the same surface.
+The field connects affected regions according to agreement in reconstructed
+brightness and surviving layer ratios. The donor search has no fixed radius.
+The stage also checks boundary influence against the brightest cell in each
+connected region, using both brightness and surviving ratios. A gradual path to
+a much darker surface is not sufficient evidence for borrowing its color.
+Unaffected low-signal cells cannot connect unrelated donors. These checks limit
+color transfer, but they do not identify surfaces or materials.
 
-A soft calibrated-neutral prior is strongest where pair evidence is absent.
-Its color metric comes from the camera matrix, rather than treating sensor-layer
-axes as equivalent. Neutrality is a preference under uncertainty, not a forced
-interpretation of balanced surviving layers. Regions without reachable donors
-still use their surviving ratios and this neutral prior.
+A *neutral prior* adds a soft constraint toward the neutral layer ratios from the
+camera calibration. The constraint is strongest where pair evidence is absent,
+but it does not classify a balanced pair as white. Regions without reachable
+donors still use their surviving ratios and the neutral prior.
 
-Spatial differences use that same calibrated color metric, including edges to
+The prior uses a *color metric*, a measure of color difference derived from the
+camera matrix. Spatial differences use the same metric, including connections to
 intact boundaries. Equal distances in raw log-layer coordinates do not represent
-equal color differences: blending a partly clipped colored region toward a
-neutral neighbor in that geometry can rotate its hue. Using one calibrated metric
-for spatial coupling and neutrality avoids that conflict without a hue-specific
-penalty. It does not resolve every missing-layer ambiguity or correct optical
-fringing; legitimate greens and defocus fringes are not inherently recovery errors.
+equal color differences. Treating those coordinates as equivalent can rotate hue
+when blending a partly clipped colored region toward a neutral neighbor. The
+shared metric avoids that conflict without a hue-specific penalty. It does not
+resolve every missing-layer ambiguity or correct optical fringing. Green colors
+and defocus fringes are not inherently recovery errors.
 
-When bad-pixel correction is enabled, camera-marked repair sites are excluded
-from Merrill color donors. Their interpolated values are replacements, not
-independent reliable measurements. This repair provenance is tracked separately
-from layer clipping reliability: it does not change tone reconstruction, repair
-itself, or the exported source-reliability mask. Recovery-off, older-sensor and
-Quattro processing retain their existing behavior.
+When bad-pixel correction is enabled, the color stage excludes camera-marked
+repair sites from its donors. Interpolated replacement values are not independent
+color measurements. The pipeline tracks these repair sites separately from layer
+clipping reliability, without changing the repair operation, tone reconstruction,
+or exported source-reliability mask. This exclusion applies only to Merrill color
+recovery, not to processing with recovery disabled or to other sensor families.
 
-Joint-guided interpolation brings the solved field back to native resolution.
-The native fit balances that field with reliable same-pixel ratios and normalizes
-the resulting direction to the fixed camera-PCS luminance. Ratios are soft
-constraints, not promises to retain absolute surviving-layer amplitudes alongside
-an independently reconstructed tone. Recovery strength increases smoothly as
-layer reliability falls. This blend is applied once, not once per stage. Fully
+Interpolation brings the field back to native resolution, with weights based on
+brightness and surviving layer ratios. The color stage checks each proposal
+against trustworthy ratios at the target pixel. Disagreement shifts the proposal
+toward calibrated neutral. The stage fits both the adjusted and unadjusted
+proposals to the same-pixel measurements, then limits the adjustment: each pair's
+reliability-weighted ratio error can increase by at most 0.035 log units relative
+to the unadjusted fit. This bound uses the pair-agreement scale to limit the loss
+of measured evidence. It is a heuristic, not a calibrated noise interval or a test
+for white surfaces.
+
+The color stage scales the fitted direction to the reconstructed brightness,
+using luminance from the camera calibration. Layer ratios are soft constraints,
+not promises to retain absolute surviving-layer values alongside an independently
+reconstructed brightness. Recovery strength increases smoothly as layer reliability
+falls. The stage applies this blend once, not once per reconstruction step. Fully
 reliable pixels retain their normalized sensor samples before shared output
 scaling and 16-bit encoding.
 
-At native resolution, trustworthy same-pixel ratios also check the proposed field
-color. Disagreement reduces borrowed color toward calibrated neutral. A second
-guard limits that adjustment after fitting: each pair's reliability-weighted
-ratio error may increase by at most the existing agreement scale (0.035 log units),
-relative to the fit with the unadjusted field color. This keeps the neutralward
-move from discarding too much measured evidence. The bound is a conservative
-heuristic, not a calibrated noise interval or a test for white surfaces.
-
-The immutable color field is shared by headroom measurement and encoding. Its
-block-preconditioned conjugate-gradient solve checks cancellation and validates
-the true residual. Invalid calibration or nonconvergence stops conversion rather
-than silently selecting another donor algorithm. This replaces the earlier local
-radius-limited color estimator. Tone reconstruction and recovery onset are
-unchanged.
+Headroom measurement and encoding read the same immutable color field. The solver
+checks cancellation and recomputes the equation error before accepting its result.
+Invalid calibration or failure to converge stops conversion rather than selecting
+another donor algorithm.
 
 ## Rust API
 
@@ -230,13 +231,14 @@ The following files are under `crates/x3f-sys/src/`:
 | `highlight_recovery.rs` | Store layer reliability and donor data, and reconstruct older native-sensor highlights. |
 | `tone_anchor.rs` | Estimate each affected pixel's starting brightness. |
 | `gradient_tone.rs` | Solve for brightness using neighboring layer differences. |
-| `color_field.rs` | Solve continuous highlight color from intact boundaries, surviving ratios and a calibrated-neutral prior. |
+| `color_field.rs` | Reconstruct highlight color from intact boundaries, surviving ratios, and a calibrated-neutral prior. |
 | `highlight_color.rs` | Apply those ratios at the chosen brightness. |
 | `recovery_mask.rs` | Write the optional source-reliability mask. |
 
-The gradient and color fields are built before the headroom and encoding passes.
-Both passes read the same immutable fields and source reliability. Encoding writes pixels in place without reading
-neighbors that might already have been overwritten.
+The pipeline builds the gradient and color fields before measuring headroom or
+encoding pixels. Both passes read the same immutable fields and source reliability.
+Encoding writes pixels in place without reading neighbors that it might have
+overwritten.
 
 Calibration helpers live under `crates/x3f-core/src/output/dng/`. The
 `Reader::get_image` method passes their result into processing for each Merrill

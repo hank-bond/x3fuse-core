@@ -30,9 +30,9 @@ pub(super) fn apply(
     if colored.iter().any(|v| !v.is_finite()) {
         return tone.samples;
     }
-    // Color confidence is already resolved by the field. Apply onset only once.
-    // Keep the established target + (colored - target) rounding for byte parity;
-    // replacing that expression with `colored` is not floating-point equivalent.
+    // The field resolves color confidence. Apply recovery onset only once.
+    // Keep the target + (colored - target) expression to preserve rounding.
+    // Replacing that expression with the `colored` value changes floating-point results.
     std::array::from_fn(|c| {
         let target = target[c] + (colored[c] - target[c]);
         if tone.strength == 1.0 {
