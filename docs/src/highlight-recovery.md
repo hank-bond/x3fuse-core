@@ -86,9 +86,16 @@ not independent red, green, and blue image channels. Recovery uses a reliability
 value for each layer: 255 means fully reliable, zero means clipped, and values in
 between describe the approach to clipping.
 
-The following three steps form a unified recovery pipeline, and are not designed to be individually toggled.  The big picture is that this approach follows a sort of "colorization" process. The First estimates the tone (luma) for each single pixel using the three color layers, then we try to optimistically refine the tone based on immediate neighboring values if they are not clipped, then we apply hue (chroma) as estimated from farther neighboring pixels.  
+The three stages form one Merrill recovery pipeline and run together. First, the
+converter estimates brightness for each affected pixel from its surviving sensor
+measurements. It refines brightness using spatial changes in reliable neighboring
+measurements. Finally, a color field combines surviving same-pixel layer ratios
+with color from reliable pixels around the affected region.
 
-Compared to the other non-Merril approaches, the most importand distinction is that the tone and hue components of the recovered values are measured and estimated discretely.
+Brightness and color are estimated in separate stages. The color field uses
+reconstructed brightness and surviving layer ratios to determine how color
+evidence connects across the image. Its estimated layer ratios are then applied
+at the reconstructed brightness for each pixel.
 
 ### 1. Estimate brightness (tone anchor)
 
