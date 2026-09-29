@@ -56,6 +56,9 @@ pub fn convert_file(
 ) -> Result<ConversionReport, Error> {
     let control = Control::new(cancel);
     control.check()?;
+    if options.dng_look.is_some() && format != OutputFormat::Dng {
+        return Err(Error::InvalidData("DCP look requires DNG output".into()));
+    }
     // Reserve ownership before any writer can truncate a caller's file.
     let reserved = OpenOptions::new()
         .write(true)

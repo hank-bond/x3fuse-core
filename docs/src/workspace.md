@@ -101,6 +101,8 @@ legacy C entry points and produce the conversion outputs.
 
 Submodules:
 
+- [`dcp.rs`](../../crates/x3f-core/src/dcp.rs) — bounded DCP look-table/tone reader;
+  [selective embedding](./dcp-look.md) preserves the DNG's own calibration.
 - [`output/`](../../crates/x3f-core/src/output/) — pure-Rust DNG, TIFF,
   and PPM writers (M3).
 - [`globals.rs`](../../crates/x3f-core/src/globals.rs) — wraps C-side

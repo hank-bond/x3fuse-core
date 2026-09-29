@@ -42,6 +42,7 @@ use x3f_sys as sys;
 use x3f_sys::sysabi as libc;
 
 mod conversion;
+pub mod dcp;
 mod globals;
 mod icc;
 mod image;
@@ -145,6 +146,11 @@ pub struct ProcessOptions {
     /// expected in the x3fuse layout: `<MODEL>[_<LENSID>]_FF_DNG_Opcodelist3_<APERTURE>`.
     /// `None` (default) skips opcode embedding.
     pub opcodes_dir: Option<std::path::PathBuf>,
+    /// Optional DCP look package for DNG output. Imports only the look table,
+    /// encoding and tone curve into the default embedded profile. Camera model
+    /// must match; calibration, white balance and raw samples stay unchanged.
+    /// The existing thumbnail is not rendered through this look. Default: none.
+    pub dng_look: Option<std::path::PathBuf>,
     /// Estimate missing highlight brightness and color when writing DNG.
     /// Defaults to `false`. Merrill uses gradient-based reconstruction.
     /// Older cameras and Quattro use separate reconstruction paths.
@@ -205,6 +211,7 @@ impl Default for ProcessOptions {
             compress: false,
             denoise_intensity: 10,
             opcodes_dir: None,
+            dng_look: None,
             dng_highlight_recovery: false,
             dng_recovery_mask: None,
             dng_highlight_mapping: DngHighlightMapping::default(),

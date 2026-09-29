@@ -92,6 +92,24 @@ pub(crate) fn write_controlled(
         check_mask_destination(path, mask)?;
     }
 
+    // Validate the optional look before processing or creating output/sidecars.
+    let look = opts
+        .dng_look
+        .as_ref()
+        .map(crate::dcp::DcpLook::open)
+        .transpose()?;
+    if let Some(look) = &look {
+        let model = exif::CaptureMetadata::from_reader(reader)
+            .unique_camera_model()
+            .ok_or_else(|| Error::InvalidData("DCP look: missing camera model".into()))?;
+        if model.to_bytes() != look.camera().as_bytes() {
+            return Err(Error::InvalidData(
+                "DCP look: camera model does not match".into(),
+            ));
+        }
+    }
+    control.check()?;
+
     // Resolve white balance up front — used both for image processing and
     // for the matrix tags.
     let mut opts = opts.clone();
@@ -312,6 +330,9 @@ pub(crate) fn write_controlled(
     );
     if write_default_profile(reader, &wb, &calibration, &mut ifd0).is_none() {
         return Err(Error::Library(crate::LibraryError::Argument));
+    }
+    if let Some(look) = look {
+        look.embed(&mut ifd0);
     }
     if !extra_offsets_abs.is_empty() {
         ifd0.add(tags::EXTRA_CAMERA_PROFILES, Value::Long(extra_offsets_abs));

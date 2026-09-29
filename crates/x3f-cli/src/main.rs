@@ -59,6 +59,7 @@ struct Args {
     use_opencl: bool,
     outdir: Option<PathBuf>,
     opcodes_dir: Option<PathBuf>,
+    dng_look: Option<PathBuf>,
     files: Vec<PathBuf>,
     verbosity: Option<Verbosity>,
     legacy_offset: Option<i32>,
@@ -91,6 +92,7 @@ impl Default for Args {
             use_opencl: false,
             outdir: None,
             opcodes_dir: None,
+            dng_look: None,
             files: Vec::new(),
             verbosity: None,
             legacy_offset: None,
@@ -145,6 +147,8 @@ fn usage(progname: &str) -> ! {
          \x20                  per-(model, aperture[, lens]) blob is embedded\n\
          \x20                  into the DNG raw IFD's OpcodeList3 tag. Files\n\
          \x20                  follow the x3fuse layout: <MODEL>[_<LENS>]_FF_DNG_Opcodelist3_<APERTURE>.\n\
+         \x20  -dcp-look <FILE> Embed DCP look table/tone only (DNG output).\n\
+         \x20                  Preserves calibration/WB; does not update preview.\n\
          \x20  -dng-highlight-recovery\n\
          \x20                  Recover clipped Foveon highlights when writing\n\
          \x20                  DNG, preserving linear highlight headroom.\n\
@@ -313,6 +317,11 @@ fn parse_args(argv: &[String]) -> Args {
                 let v = argv.get(i).unwrap_or_else(|| usage(progname));
                 args.opcodes_dir = Some(PathBuf::from(v));
             }
+            "-dcp-look" => {
+                i += 1;
+                let v = argv.get(i).unwrap_or_else(|| usage(progname));
+                args.dng_look = Some(PathBuf::from(v));
+            }
             "-dng-highlight-recovery" => args.dng_highlight_recovery = true,
             "-dng-recovery-mask" => args.dng_recovery_mask = true,
             "-dng-highlight-mapping" => {
@@ -370,6 +379,9 @@ fn normalize(args: &mut Args) {
 /// usage()-style exit. Kept as a pure function so the unit tests can
 /// exercise it without `process::exit`.
 fn validate_args(args: &Args) -> Result<(), String> {
+    if args.dng_look.is_some() && args.file_type != FileType::Dng {
+        return Err("-dcp-look requires DNG output".into());
+    }
     if args.dng_recovery_mask {
         if args.file_type != FileType::Dng || !args.dng_highlight_recovery || args.cineon {
             return Err("-dng-recovery-mask requires DNG output and -dng-highlight-recovery, without -cineon".to_string());
@@ -506,6 +518,7 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         wb: args.wb.clone(),
         compress: args.compress,
         opcodes_dir: args.opcodes_dir.clone(),
+        dng_look: args.dng_look.clone(),
         dng_highlight_recovery: args.dng_highlight_recovery,
         dng_recovery_mask: args
             .dng_recovery_mask
@@ -759,6 +772,16 @@ mod tests {
         assert_eq!(a.color_encoding, ColorEncoding::Unprocessed);
         let a = parse(&["-color", "sRGB", "-qtop", "in.X3F"]);
         assert_eq!(a.color_encoding, ColorEncoding::Qtop);
+    }
+
+    #[test]
+    fn dcp_look_is_opt_in_and_dng_only() {
+        assert!(parse(&["in.X3F"]).dng_look.is_none());
+        let args = parse(&["-dcp-look", "look.dcp", "in.X3F"]);
+        assert_eq!(args.dng_look, Some(PathBuf::from("look.dcp")));
+        assert!(validate_args(&args).is_ok());
+        let args = parse(&["-tiff", "-dcp-look", "look.dcp", "in.X3F"]);
+        assert!(validate_args(&args).is_err());
     }
 
     #[test]
