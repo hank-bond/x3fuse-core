@@ -109,8 +109,7 @@ pub(super) fn recover_severe(
     }
     let neutral_y = dot(y, neutral);
     let measured_y = dot(y, measured);
-    if !neutral_y.is_finite() || neutral_y <= 1e-12 || !measured_y.is_finite() || measured_y <= 0.0
-    {
+    if !neutral_y.is_finite() || neutral_y <= 1e-12 || !measured_y.is_finite() {
         return hold;
     }
     let h = |x: f64| {
@@ -129,7 +128,10 @@ pub(super) fn recover_severe(
         envelope
     };
     let guarded = trust * mean + (1.0 - trust) * envelope;
-    let held = measured_y / neutral_y;
+    // Severe clipping can make matrix luminance negative. A zero floor
+    // prevents that value from reducing the layer-based brightness estimate
+    // and keeps the blend continuous at zero luminance.
+    let held = (measured_y / neutral_y).max(0.0);
     let amplitude = held + severity * (guarded - held);
     if !amplitude.is_finite() || amplitude <= 0.0 {
         return hold;
@@ -219,10 +221,10 @@ mod tests {
     }
 
     #[test]
-    fn severe_retains_invalid_input_and_nonpositive_y_policy() {
+    fn severe_retains_invalid_input_and_calibration_policy() {
         for (s, p, y) in [
             ([-0.1, 0.8, 1.0], P, Y),
-            ([0.8, 0.01, 1.0], P, Y),
+            ([0.8, 0.9, 1.0], P, [f64::INFINITY, 0.0, 0.0]),
             ([0.8, 0.9, 1.0], [0.0, 0.5, 1.0], Y),
             ([0.8, 0.9, 1.0], P, [0.0; 3]),
         ] {
@@ -230,6 +232,65 @@ mod tests {
                 recover_severe(s, [1, 1, 0], p, y).samples,
                 recover_luminance(s, [1, 1, 0], p, y).samples
             );
+        }
+    }
+
+    #[test]
+    fn severe_negative_luminance_uses_layer_estimate() {
+        // Clipped DP2 Merrill sensor samples produce negative matrix luminance.
+        // Uniform output scaling preserves the recovery decision.
+        let p = [0.4 / 1.4262, 0.8658 / 1.4262, 1.0];
+        let y = [-0.7552 / p[0], 2.0028 / p[1], -0.2476];
+        for s in [
+            [17321.0 / 65535.0, 15221.0 / 65535.0, 16137.0 / 65535.0],
+            [17250.0 / 65535.0, 15160.0 / 65535.0, 16071.0 / 65535.0],
+        ] {
+            assert!(dot(y, s) < 0.0);
+            for mask in [[0; 3], [255, 0, 0], [1, 1, 0], [255, 127, 0]] {
+                let r = recover_severe(s, mask, p, y);
+                assert!(r.available && r.amplitude > 0.0);
+                close(r.strength, 1.0);
+                assert!(dot(y, r.samples) > 0.0);
+                for c in 0..3 {
+                    close(r.samples[c], r.amplitude * p[c]);
+                }
+                if mask == [0; 3] || mask == [255, 0, 0] {
+                    close(r.amplitude, s[0] / p[0]);
+                }
+            }
+            for mask in [[255; 3], [255, 255, 0], [128; 3]] {
+                let r = recover_severe(s, mask, p, y);
+                assert!(!r.available);
+                assert_eq!(r.samples, s);
+            }
+        }
+    }
+
+    #[test]
+    fn severe_is_continuous_across_zero_matrix_luminance() {
+        let s = [0.8, -(Y[0] * 0.8 + Y[2]) / Y[1], 1.0];
+        for mask in [[0; 3], [255, 0, 0], [255, 64, 0], [255, 127, 0]] {
+            let mut low = s;
+            let mut high = s;
+            low[1] -= 1e-9;
+            high[1] += 1e-9;
+            assert!(dot(Y, low) < 0.0 && dot(Y, high) > 0.0);
+            let a = recover_severe(low, mask, P, Y);
+            let b = recover_severe(high, mask, P, Y);
+            assert!(a.available && b.available);
+            assert!((a.amplitude - b.amplitude).abs() < 1e-7);
+        }
+    }
+
+    #[test]
+    fn severe_negative_luminance_scales_linearly() {
+        let s = [0.8, 0.3, 1.0];
+        assert!(dot(Y, s) < 0.0);
+        for mask in [[0; 3], [255, 0, 0], [2, 2, 4], [255, 127, 0]] {
+            let a = recover_severe(s, mask, P, Y);
+            let b = recover_severe(s.map(|v| v * 4.0), mask, P, Y);
+            assert!(a.available && b.available);
+            close(b.amplitude, 4.0 * a.amplitude);
         }
     }
 
