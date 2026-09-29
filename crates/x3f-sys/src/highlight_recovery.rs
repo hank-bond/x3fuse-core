@@ -8,9 +8,6 @@ use crate::sysabi as libc;
 use std::ffi::CStr;
 use std::ptr;
 
-#[path = "donor_chroma.rs"]
-mod donor_chroma;
-
 const TILE_SIZE: usize = 16;
 const PYRAMID_LEVELS: usize = 5;
 const MIN_DONORS: f64 = 8.0;
@@ -30,6 +27,9 @@ pub struct SensorReliability {
     /// Nonempty, validated Merrill SatMaps, in bottom/middle/top bit order.
     /// Preserve this status when cropping the accompanying reliability data.
     pub camera_map_channels: u8,
+    /// Camera-marked repair sites that cannot supply independent color evidence.
+    /// Track these sites separately from layer clipping reliability.
+    pub repair_marked: Vec<bool>,
 }
 
 impl SensorReliability {
@@ -41,12 +41,16 @@ impl SensorReliability {
         let mut data = Vec::new();
         data.try_reserve_exact(count).ok()?;
         data.resize(count, [255; 3]);
+        let mut repair_marked = Vec::new();
+        repair_marked.try_reserve_exact(count).ok()?;
+        repair_marked.resize(count, false);
         Some(Self {
             rows,
             cols,
             data,
             noise: noise.map(|n| if n.is_finite() { n.max(0.0) } else { 0.0 }),
             camera_map_channels: 0,
+            repair_marked,
         })
     }
 
@@ -299,7 +303,8 @@ impl LocalRecovery {
     ) -> Option<Self> {
         control.check().ok()?;
         let count = reliability.rows.checked_mul(reliability.cols)?;
-        if count == 0 || count != reliability.data.len() {
+        if count == 0 || count != reliability.data.len() || count != reliability.repair_marked.len()
+        {
             return None;
         }
         let tile_rows = reliability.rows.checked_add(TILE_SIZE - 1)? / TILE_SIZE;
@@ -308,7 +313,8 @@ impl LocalRecovery {
         for row in 0..reliability.rows {
             control.check().ok()?;
             for col in 0..reliability.cols {
-                if reliability.data[row * reliability.cols + col] != [255; 3] {
+                let index = row * reliability.cols + col;
+                if reliability.data[index] != [255; 3] || reliability.repair_marked[index] {
                     continue;
                 }
                 let s = sample(row, col);
@@ -375,6 +381,13 @@ impl LocalRecovery {
             return [0; 3];
         }
         self.reliability.data[row * self.reliability.cols + col]
+    }
+
+    /// Interpolated repair values are not independent color measurements.
+    pub fn repaired_site(&self, row: usize, col: usize) -> bool {
+        row >= self.reliability.rows
+            || col >= self.reliability.cols
+            || self.reliability.repair_marked[row * self.reliability.cols + col]
     }
 
     pub fn has_camera_maps(&self) -> bool {
@@ -583,27 +596,6 @@ impl LocalRecovery {
         let mut reference = s;
         reference[target] = predicted;
         Some((reference, confidence.clamp(0.0, 1.0)))
-    }
-
-    /// Chromaticity evidence for the Merrill reconstruction branch, not
-    /// reconstructed layer values. Uses the existing healthy donor admission.
-    pub fn colorization_direction(
-        &self,
-        row: usize,
-        col: usize,
-        s: [f64; 3],
-        radius: usize,
-    ) -> Option<([f64; 3], f64)> {
-        if row >= self.reliability.rows || col >= self.reliability.cols {
-            return None;
-        }
-        donor_chroma::Settings::colorization(radius).estimate(
-            &self.levels[0],
-            [row as f64, col as f64],
-            s,
-            self.mask(row, col),
-            self.reliability.noise,
-        )
     }
 
     pub fn recover(&self, row: usize, col: usize, s: [f64; 3], prior: [f64; 3]) -> RecoveryResult {

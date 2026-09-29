@@ -134,14 +134,64 @@ silently switch to another reconstruction method.
 
 ### 3. Add highlight color
 
-Nearby reliable pixels supply color ratios, not brightness or texture. These
-pixels are called *donors*. The search uses a fixed 256-pixel radius and reduces
-the weight of donors whose ratios disagree with the available layer measurements.
-A mix of inconsistent donor colors also lowers confidence.
+The color stage reconstructs a *color field*, a grid of logarithmic layer ratios
+with 8-pixel spacing. Intact pixels supply color ratios at the boundaries of
+affected regions. These pixels are the color *donors*. Reliable pairs of layers
+at the same pixel also constrain the field. One surviving layer cannot determine
+hue. A balanced pair does not establish white, because the missing third layer
+could distinguish a colored surface from a neutral one.
 
-The color stage scales the selected ratios to the reconstructed brightness.
-Without usable donor color, it keeps the tone result. Recovery strength increases
-smoothly as layer reliability falls. This blend is applied once, not once per stage.
+The field connects affected regions according to agreement in reconstructed
+brightness and surviving layer ratios. The donor search has no fixed radius.
+The stage also checks boundary influence against the brightest cell in each
+connected region, using both brightness and surviving ratios. A gradual path to
+a much darker surface is not sufficient evidence for borrowing its color.
+Unaffected low-signal cells cannot connect unrelated donors. These checks limit
+color transfer, but they do not identify surfaces or materials.
+
+A *neutral prior* adds a soft constraint toward the neutral layer ratios from the
+camera calibration. The constraint is strongest where pair evidence is absent,
+but it does not classify a balanced pair as white. Regions without reachable
+donors still use their surviving ratios and the neutral prior.
+
+The prior uses a *color metric*, a measure of color difference derived from the
+camera matrix. Spatial differences use the same metric, including connections to
+intact boundaries. Equal distances in raw log-layer coordinates do not represent
+equal color differences. Treating those coordinates as equivalent can rotate hue
+when blending a partly clipped colored region toward a neutral neighbor. The
+shared metric avoids that conflict without a hue-specific penalty. It does not
+resolve every missing-layer ambiguity or correct optical fringing. Green colors
+and defocus fringes are not inherently recovery errors.
+
+When bad-pixel correction is enabled, the color stage excludes camera-marked
+repair sites from its donors. Interpolated replacement values are not independent
+color measurements. The pipeline tracks these repair sites separately from layer
+clipping reliability, without changing the repair operation, tone reconstruction,
+or exported source-reliability mask. This exclusion applies only to Merrill color
+recovery, not to processing with recovery disabled or to other sensor families.
+
+Interpolation brings the field back to native resolution, with weights based on
+brightness and surviving layer ratios. The color stage checks each proposal
+against trustworthy ratios at the target pixel. Disagreement shifts the proposal
+toward calibrated neutral. The stage fits both the adjusted and unadjusted
+proposals to the same-pixel measurements, then limits the adjustment: each pair's
+reliability-weighted ratio error can increase by at most 0.035 log units relative
+to the unadjusted fit. This bound uses the pair-agreement scale to limit the loss
+of measured evidence. It is a heuristic, not a calibrated noise interval or a test
+for white surfaces.
+
+The color stage scales the fitted direction to the reconstructed brightness,
+using luminance from the camera calibration. Layer ratios are soft constraints,
+not promises to retain absolute surviving-layer values alongside an independently
+reconstructed brightness. Recovery strength increases smoothly as layer reliability
+falls. The stage applies this blend once, not once per reconstruction step. Fully
+reliable pixels retain their normalized sensor samples before shared output
+scaling and 16-bit encoding.
+
+Headroom measurement and encoding read the same immutable color field. The solver
+checks cancellation and recomputes the equation error before accepting its result.
+Invalid calibration or failure to converge stops conversion rather than selecting
+another donor algorithm.
 
 ## Rust API
 
@@ -181,13 +231,14 @@ The following files are under `crates/x3f-sys/src/`:
 | `highlight_recovery.rs` | Store layer reliability and donor data, and reconstruct older native-sensor highlights. |
 | `tone_anchor.rs` | Estimate each affected pixel's starting brightness. |
 | `gradient_tone.rs` | Solve for brightness using neighboring layer differences. |
-| `donor_chroma.rs` | Estimate nearby color ratios and confidence. |
+| `color_field.rs` | Reconstruct highlight color from intact boundaries, surviving ratios, and a calibrated-neutral prior. |
 | `highlight_color.rs` | Apply those ratios at the chosen brightness. |
 | `recovery_mask.rs` | Write the optional source-reliability mask. |
 
-The gradient field is built before the headroom and encoding passes. Both passes
-read the same field and donor data. Encoding writes pixels in place without reading
-neighbors that might already have been overwritten.
+The pipeline builds the gradient and color fields before measuring headroom or
+encoding pixels. Both passes read the same immutable fields and source reliability.
+Encoding writes pixels in place without reading neighbors that it might have
+overwritten.
 
 Calibration helpers live under `crates/x3f-core/src/output/dng/`. The
 `Reader::get_image` method passes their result into processing for each Merrill
@@ -226,9 +277,8 @@ layers from color-profile training. The mask does not say which output pixels
 changed or how much detail is recoverable.
 
 Invalid calibration, missing required layer data, and numerical solver failures
-return conversion errors. Solver, headroom, and mask diagnostics use the library's
-verbosity and log callback settings. A failed conversion must not be treated as a
-usable output.
+return conversion errors. Recovery errors use the library's verbosity and log
+callback settings. A failed conversion must not be treated as a usable output.
 
 Recovery estimates brightness and color separately, and either estimate can be
 wrong. Differences between neighboring layer measurements may come from a change

@@ -72,7 +72,7 @@ mirror of what used to be in `src/`:
 | `histogram_wasm_stub.rs`, `print_meta_wasm_stub.rs` | wasm32 fallbacks (no variadics) | M8d-α |
 
 Merrill DNG recovery uses `tone_anchor.rs` for brightness estimates,
-`gradient_tone.rs` for spatial detail, and `donor_chroma.rs` with
+`gradient_tone.rs` for spatial detail, and `color_field.rs` with
 `highlight_color.rs` for color. `recovery_mask.rs` exports the optional
 source-reliability mask. See [DNG highlight recovery](./highlight-recovery.md)
 and [recovery masks](./recovery-mask.md).

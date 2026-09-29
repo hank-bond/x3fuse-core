@@ -13,12 +13,9 @@ pub(super) fn apply(
     neutral: [f64; 3],
     y: [f64; 3],
     direction: [f64; 3],
-    confidence: f64,
 ) -> [f64; 3] {
     if !tone.available
         || tone.strength <= 0.0
-        || !confidence.is_finite()
-        || confidence <= 0.0
         || direction.iter().any(|v| !v.is_finite() || *v <= 0.0)
     {
         return tone.samples;
@@ -33,11 +30,11 @@ pub(super) fn apply(
     if colored.iter().any(|v| !v.is_finite()) {
         return tone.samples;
     }
-    let weight = confidence.clamp(0.0, 1.0);
-    // Color the target before blending it with the measured pixel.
-    // Blending donor color into the `tone.samples` field would apply recovery strength twice.
+    // The field resolves color confidence. Apply recovery onset only once.
+    // Keep the target + (colored - target) expression to preserve rounding.
+    // Replacing that expression with the `colored` value changes floating-point results.
     std::array::from_fn(|c| {
-        let target = target[c] + weight * (colored[c] - target[c]);
+        let target = target[c] + (colored[c] - target[c]);
         if tone.strength == 1.0 {
             target
         } else {
@@ -61,10 +58,8 @@ mod tests {
         let measured = [0.32, 0.72, 1.0];
         for reliability in 0..=255 {
             let t = tone_anchor::recover(measured, [255, 255, reliability], P);
-            for confidence in [0.0, 0.001, 0.25, 0.5, 1.0] {
-                let c = apply(measured, &t, P, Y, D, confidence);
-                close(dot(Y, c), dot(Y, t.samples));
-            }
+            let c = apply(measured, &t, P, Y, D);
+            close(dot(Y, c), dot(Y, t.samples));
         }
     }
     #[test]
@@ -72,7 +67,7 @@ mod tests {
         for s in [[0.32, 0.72, 1.0], [-0.01, 0.4, 0.9], [0.5, 0.1, 0.9]] {
             for mask in [[255; 3], [0; 3]] {
                 let t = tone_anchor::recover(s, mask, P);
-                assert_eq!(apply(s, &t, P, Y, D, 1.0), s);
+                assert_eq!(apply(s, &t, P, Y, D), s);
             }
         }
     }
@@ -81,42 +76,41 @@ mod tests {
         let s = [0.32, 0.72, 1.0];
         let t = tone_anchor::recover(s, [255, 255, 0], P);
         for d in [[0.0; 3], [f64::NAN, 1.0, 1.0], [1.0, 0.01, 1.0]] {
-            let c = apply(s, &t, P, Y, d, 1.0);
+            let c = apply(s, &t, P, Y, d);
             assert_eq!(c, t.samples);
-        }
-        for confidence in [0.0, -1.0, f64::NAN] {
-            assert_eq!(apply(s, &t, P, Y, D, confidence), t.samples);
         }
     }
     #[test]
-    fn full_confidence_keeps_donor_color_at_tone_brightness() {
+    fn color_direction_is_applied_at_tone_brightness() {
         let s = [0.32, 0.72, 1.0];
         let t = tone_anchor::recover(s, [255, 255, 0], P);
-        let c = apply(s, &t, P, Y, D, 1.0);
+        let c = apply(s, &t, P, Y, D);
         for i in 1..3 {
             close(c[i] / D[i], c[0] / D[0]);
         }
         assert!((c[2] / c[1] - P[2] / P[1]).abs() > 0.1);
     }
     #[test]
-    fn chroma_fades_linearly_without_moving_luminance() {
+    fn preserves_the_frozen_full_color_rounding() {
         let s = [0.32, 0.72, 1.0];
         let t = tone_anchor::recover(s, [255, 255, 0], P);
-        let full = apply(s, &t, P, Y, D, 1.0);
-        for confidence in [0.01, 0.25, 0.75] {
-            let c = apply(s, &t, P, Y, D, confidence);
-            for i in 0..3 {
-                close(c[i] - t.samples[i], confidence * (full[i] - t.samples[i]));
-            }
-        }
+        let d = [1e-20, 0.58, 1.17];
+        let target = P.map(|v| v * t.amplitude);
+        let colored = d.map(|v| v * (dot(Y, target) / dot(Y, d)));
+        let old: [f64; 3] = std::array::from_fn(|c| target[c] + 1.0 * (colored[c] - target[c]));
+        assert_eq!(
+            apply(s, &t, P, Y, d).map(f64::to_bits),
+            old.map(f64::to_bits)
+        );
+        assert_ne!(old[0].to_bits(), colored[0].to_bits());
     }
     #[test]
     fn donor_intensity_cannot_change_color_or_tone() {
         let s = [0.32, 0.72, 1.0];
         let t = tone_anchor::recover(s, [255, 255, 0], P);
-        let reference = apply(s, &t, P, Y, D, 0.75);
+        let reference = apply(s, &t, P, Y, D);
         for scale in [0.1, 2.0, 10.0] {
-            let c = apply(s, &t, P, Y, D.map(|v| v * scale), 0.75);
+            let c = apply(s, &t, P, Y, D.map(|v| v * scale));
             for i in 0..3 {
                 close(c[i], reference[i]);
             }
@@ -127,7 +121,7 @@ mod tests {
         let s = [0.32, 0.72, 1.0];
         let t = tone_anchor::recover(s, [255, 255, 207], P);
         let scale = dot(Y, P.map(|v| v * t.amplitude)) / dot(Y, D);
-        let c = apply(s, &t, P, Y, D, 1.0);
+        let c = apply(s, &t, P, Y, D);
         for i in 0..3 {
             close(c[i], s[i] + t.strength * (scale * D[i] - s[i]));
         }
@@ -136,7 +130,7 @@ mod tests {
     fn existing_neutral_chromaticity_does_not_add_a_cast() {
         let s = [0.32, 0.72, 1.0];
         let t = tone_anchor::recover(s, [255, 255, 180], P);
-        let c = apply(s, &t, P, Y, P, 0.8);
+        let c = apply(s, &t, P, Y, P);
         for i in 0..3 {
             close(c[i], t.samples[i]);
         }
