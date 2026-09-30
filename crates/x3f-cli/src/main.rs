@@ -147,7 +147,7 @@ fn usage(progname: &str) -> ! {
          \x20                  per-(model, aperture[, lens]) blob is embedded\n\
          \x20                  into the DNG raw IFD's OpcodeList3 tag. Files\n\
          \x20                  follow the x3fuse layout: <MODEL>[_<LENS>]_FF_DNG_Opcodelist3_<APERTURE>.\n\
-         \x20  -dcp-look <FILE> Embed a DCP look table and tone curve in the DNG.\n\
+         \x20  -dng-look <FILE> Embed a DCP look table and tone curve in the DNG.\n\
          \x20                  Leaves calibration and the thumbnail unchanged.\n\
          \x20  -dng-highlight-recovery\n\
          \x20                  Recover clipped Foveon highlights when writing\n\
@@ -317,7 +317,7 @@ fn parse_args(argv: &[String]) -> Args {
                 let v = argv.get(i).unwrap_or_else(|| usage(progname));
                 args.opcodes_dir = Some(PathBuf::from(v));
             }
-            "-dcp-look" => {
+            "-dng-look" => {
                 i += 1;
                 let v = argv.get(i).unwrap_or_else(|| usage(progname));
                 args.dng_look = Some(PathBuf::from(v));
@@ -380,7 +380,7 @@ fn normalize(args: &mut Args) {
 /// exercise it without `process::exit`.
 fn validate_args(args: &Args) -> Result<(), String> {
     if args.dng_look.is_some() && args.file_type != FileType::Dng {
-        return Err("-dcp-look requires DNG output".into());
+        return Err("-dng-look requires DNG output".into());
     }
     if args.dng_recovery_mask {
         if args.file_type != FileType::Dng || !args.dng_highlight_recovery || args.cineon {
@@ -775,12 +775,12 @@ mod tests {
     }
 
     #[test]
-    fn dcp_look_is_opt_in_and_dng_only() {
+    fn dng_look_is_opt_in_and_dng_only() {
         assert!(parse(&["in.X3F"]).dng_look.is_none());
-        let args = parse(&["-dcp-look", "look.dcp", "in.X3F"]);
+        let args = parse(&["-dng-look", "look.dcp", "in.X3F"]);
         assert_eq!(args.dng_look, Some(PathBuf::from("look.dcp")));
         assert!(validate_args(&args).is_ok());
-        let args = parse(&["-dng", "-dcp-look", "色 look.dcp", "in.X3F"]);
+        let args = parse(&["-dng", "-dng-look", "色 look.dcp", "in.X3F"]);
         assert_eq!(args.dng_look, Some(PathBuf::from("色 look.dcp")));
         assert!(validate_args(&args).is_ok());
         for file_type in [

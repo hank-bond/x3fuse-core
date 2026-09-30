@@ -72,7 +72,7 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 | `-dng-highlight-recovery` | Foveon highlight recovery for DNG (see [DNG output](#dng-output))                |
 | `-dng-highlight-mapping <MODE>` | store recovered highlights with `linear` (default) or `shoulder` mapping |
 | `-dng-recovery-mask`      | write a source-reliability mask beside the DNG (requires recovery)             |
-| `-dcp-look <FILE>`        | embed a DCP look table and tone curve ([guide](docs/src/dcp-look.md)) |
+| `-dng-look <FILE>`        | embed a DCP look table and tone curve ([guide](docs/src/dng-look.md)) |
 | `-cineon`                 | 16-bit TIFF with a Cineon-style log tone curve baked in (requires `-tiff`)         |
 | `-offset <OFF>`           | RAW offset for SD14 and older (automatic if omitted)                               |
 | `-matrixmax <M>`          | max matrix elements in metadata dump (default 100)                                 |

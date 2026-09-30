@@ -10,7 +10,7 @@ use tiff::decoder::{ifd::Value, Decoder};
 use tiff::tags::{IfdPointer, Tag};
 use x3f_core::{convert_file, dcp::DcpLook, Error, OutputFormat, ProcessOptions, Reader};
 
-#[path = "common/dcp.rs"]
+#[path = "dcp_fixture.rs"]
 mod fixture;
 
 struct Scratch(PathBuf);
@@ -175,9 +175,12 @@ fn look_preserves_raw_preview_calibration_and_recovery_output() {
             let profiled = scratch.0.join(format!("look-{label}.dng"));
             convert(&source, &baseline, &options);
             let before = Dng::read(&baseline);
-            let camera = before.root[&50708].clone().into_string().unwrap();
+            assert_ne!(
+                before.root[&50708].clone().into_string().unwrap(),
+                "Another camera"
+            );
             let path = scratch.0.join("look.dcp");
-            fs::write(&path, fixture::profile(&camera, compress)).unwrap();
+            fs::write(&path, fixture::profile("Another camera", compress)).unwrap();
             convert(
                 &source,
                 &profiled,
@@ -238,10 +241,8 @@ fn invalid_look_leaves_no_conversion_output_or_recovery_mask() {
         denoise_intensity: 0,
         ..ProcessOptions::default()
     };
-    for bytes in [
-        b"not a DCP".to_vec(),
-        fixture::profile("Wrong camera", false),
-    ] {
+    let truncated = fixture::profile("Any camera", false)[..16].to_vec();
+    for bytes in [b"not a DCP".to_vec(), truncated] {
         fs::write(&look, bytes).unwrap();
         let result = convert_file(
             &source,

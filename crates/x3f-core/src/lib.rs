@@ -147,7 +147,7 @@ pub struct ProcessOptions {
     /// `None` (default) skips opcode embedding.
     pub opcodes_dir: Option<std::path::PathBuf>,
     /// Optional DCP file whose look table and tone curve replace those in the
-    /// default DNG profile. The camera model must match. Leaves calibration,
+    /// default DNG profile, regardless of camera model. Leaves calibration,
     /// raw samples, and the thumbnail unchanged. Defaults to `None`.
     pub dng_look: Option<std::path::PathBuf>,
     /// Estimate missing highlight brightness and color when writing DNG.

@@ -102,7 +102,7 @@ legacy C entry points and produce the conversion outputs.
 Submodules:
 
 - [`dcp.rs`](../../crates/x3f-core/src/dcp.rs) reads DCP look tables and tone curves.
-  [Embedding a look](./dcp-look.md) leaves camera calibration unchanged.
+  [Embedding a look](./dng-look.md) leaves camera calibration unchanged.
 - [`output/`](../../crates/x3f-core/src/output/) — pure-Rust DNG, TIFF,
   and PPM writers (M3).
 - [`globals.rs`](../../crates/x3f-core/src/globals.rs) — wraps C-side

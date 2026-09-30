@@ -92,24 +92,11 @@ pub(crate) fn write_controlled(
         check_mask_destination(path, mask)?;
     }
 
-    let capture_meta = exif::CaptureMetadata::from_reader(reader);
-    let unique_camera_model = capture_meta
-        .unique_camera_model()
-        .ok_or(Error::Library(crate::LibraryError::Argument))?;
     let look = opts
         .dng_look
         .as_ref()
         .map(crate::dcp::DcpLook::open)
         .transpose()?;
-    if let Some(look) = &look {
-        if unique_camera_model.to_bytes() != look.camera().as_bytes() {
-            return Err(Error::InvalidData(format!(
-                "DCP look: expected camera {}, found {}",
-                look.camera(),
-                unique_camera_model.to_string_lossy(),
-            )));
-        }
-    }
     control.check()?;
 
     // Resolve white balance up front — used both for image processing and
@@ -205,6 +192,12 @@ pub(crate) fn write_controlled(
     // reader even when Rayon schedules work from multiple conversions.
     let highlight_scale = image.dng_highlight_scale;
 
+    // Resolve required identity before opening the output. Quattro stores
+    // Make/Model in JPEG EXIF rather than CAMF, so use the shared fallback.
+    let capture_meta = exif::CaptureMetadata::from_reader(reader);
+    let unique_camera_model = capture_meta
+        .unique_camera_model()
+        .ok_or(Error::Library(crate::LibraryError::Argument))?;
     let orientation = capture_meta.orientation.unwrap_or(1);
 
     control.check()?;
