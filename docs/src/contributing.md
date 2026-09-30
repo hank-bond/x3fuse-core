@@ -398,6 +398,25 @@ does not establish correct color throughout the image. Default exposure
 and tone can differ between readers; these checks do not establish
 calibrated color accuracy or identical JPEG appearance.
 
+## DCP look checks
+
+Run the parser tests without camera files:
+
+```sh
+cargo test -p x3f-core --lib dcp
+```
+
+Use a local camera file to check embedding and failure handling:
+
+```sh
+X3F_TEST_FILES=/path/to/fixtures cargo test --release -p x3f-core --test dcp
+```
+
+The conversion tests use the first X3F in that directory. They compare raw strips,
+thumbnail strips, and calibration with and without a look, using both compression
+settings and both recovery settings. Also validate a converted DNG with the Adobe
+SDK. A valid container does not establish the quality of its rendered look.
+
 ## Filing a PR
 
 - Reference the milestone (`M6e10`, `M7d`, etc.) in the commit
