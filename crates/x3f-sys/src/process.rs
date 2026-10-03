@@ -3369,7 +3369,7 @@ unsafe fn apply_highlight_clip_dng_impl(
         None
     };
     ctx.gradient = gradient.as_ref();
-    let color_field = if ctx.camera_y.is_some() {
+    let color_field = if ctx.camera_y.is_some() && !no_chroma {
         match unsafe {
             color_field::Field::build(
                 &ctx,
@@ -4383,6 +4383,163 @@ static _A_X3F_GET_PREVIEW: unsafe extern "C" fn(
 #[cfg(test)]
 mod tests {
     use super::{intermediate_levels, shoulder_compress, INTERMEDIATE_UNIT};
+
+    const MERRILL_PRIOR: [f64; 3] = [0.284206, 0.604436, 1.0];
+    const MERRILL_Y: [f64; 3] = [-2.6575486148565814, 3.313530567081604, -0.2476];
+
+    fn merrill_recovery(pixels: &[[u16; 3]], columns: usize, chroma: bool) -> Vec<[f64; 3]> {
+        use super::*;
+        let mut matrix = [
+            4.45774, -1.90728, 0.581922, -4.22818, 4.30012, -0.701463, 3.1376, -5.81127, 3.31683,
+        ];
+        let mut ctx = recovery_test_context(&MERRILL_PRIOR);
+        ctx.conv_matrix = matrix.as_mut_ptr();
+        ctx.camera_y = Some(MERRILL_Y);
+        ctx.rows = (pixels.len() / columns) as i32;
+        ctx.cols = columns as i32;
+        let data: Vec<_> = pixels.iter().flatten().copied().collect();
+        let mut reliability =
+            SensorReliability::new(ctx.rows as usize, columns, [0.001; 3]).unwrap();
+        for (mask, pixel) in reliability.data.iter_mut().zip(pixels) {
+            *mask = pixel.map(|v| channel_reliability(v as f64 / 10000.0, 0.0, 0.99, 0.04));
+        }
+        let local = LocalRecovery::build(
+            reliability,
+            |r, c| pixels[r * columns + c].map(|v| v as f64 / 10000.0),
+            None,
+        )
+        .unwrap();
+        let gradient = unsafe {
+            gradient_tone::Field::build(&ctx, Some(&local), &data, columns * 3, Control::none())
+        }
+        .unwrap();
+        ctx.gradient = Some(&gradient);
+        let field = chroma.then(|| {
+            unsafe { color_field::Field::build(&ctx, &local, &data, columns * 3, Control::none()) }
+                .unwrap()
+        });
+        ctx.color_field = field.as_ref();
+        pixels
+            .iter()
+            .enumerate()
+            .map(|(i, pixel)| unsafe {
+                dng_evaluate_pixel(
+                    &ctx,
+                    Some(&local),
+                    i / columns,
+                    i % columns,
+                    pixel,
+                    ptr::null_mut(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merrill_color_cancellation_does_not_exceed_encoder_headroom() {
+        use super::*;
+        let pixels = [[100, 5600, 10000]; 256];
+        let color = merrill_recovery(&pixels, 16, true);
+        let tone = merrill_recovery(&pixels, 16, false);
+        for (a, b) in color.iter().zip(&tone) {
+            assert!(a.iter().all(|v| v.is_finite() && *v <= DNG_MAX_HEADROOM));
+            let dy: f64 = (0..3).map(|c| MERRILL_Y[c] * (a[c] - b[c])).sum();
+            assert!(dy.abs() < 1e-10, "color fallback changed brightness");
+        }
+    }
+
+    #[test]
+    fn merrill_recovery_is_continuous_at_half_reliability() {
+        let a = merrill_recovery(&[[9700, 4000, 10000]; 256], 16, true);
+        let b = merrill_recovery(&[[9701, 4000, 10000]; 256], 16, true);
+        assert!(a
+            .iter()
+            .flatten()
+            .zip(b.iter().flatten())
+            .all(|(x, y)| (x - y).abs() < 0.01));
+    }
+
+    #[test]
+    fn merrill_stripes_keep_white_and_colored_highlights_separate() {
+        let rows = 45;
+        for (width, diagonal, transpose) in [
+            (1, false, false),
+            (2, false, true),
+            (4, false, false),
+            (8, false, false),
+            (4, true, false),
+        ] {
+            // Leave room for diagonal bands to reach intact donors in the top
+            // rows. Bands entering through the clipped side have no known hue.
+            let cols = if diagonal { 77 } else { 29 }; // Partial edge cells.
+            let pixels: Vec<[u16; 3]> = (0..rows)
+                .flat_map(|r| {
+                    (0..cols).map(move |c| {
+                        let exposure = 0.65 + 0.02 * r as f64;
+                        let yellow = (c + if diagonal { r } else { 0 }) / width % 2 == 1;
+                        std::array::from_fn(|k| {
+                            let color = if yellow && k < 2 { 1.25 } else { 1.0 };
+                            (10000.0 * (MERRILL_PRIOR[k] * color * exposure).min(1.0)).round()
+                                as u16
+                        })
+                    })
+                })
+                .collect();
+            let out = if transpose {
+                let transposed: Vec<_> = (0..cols)
+                    .flat_map(|c| {
+                        (0..rows).map({
+                            let pixels = &pixels;
+                            move |r| pixels[r * cols + c]
+                        })
+                    })
+                    .collect();
+                let recovered = merrill_recovery(&transposed, rows, true);
+                (0..rows)
+                    .flat_map(|r| {
+                        (0..cols).map({
+                            let recovered = &recovered;
+                            move |c| recovered[c * rows + r]
+                        })
+                    })
+                    .collect()
+            } else {
+                merrill_recovery(&pixels, cols, true)
+            };
+            let tone = merrill_recovery(&pixels, cols, false);
+            for ((source, color), tone) in pixels.iter().zip(&out).zip(tone) {
+                let dy: f64 = (0..3).map(|k| MERRILL_Y[k] * (color[k] - tone[k])).sum();
+                assert!(dy.abs() < 1e-7, "edge refinement changed brightness");
+                if source.iter().all(|v| *v < 9500) {
+                    assert_eq!(*color, source.map(|v| v as f64 / 10000.0));
+                }
+            }
+            let mut white_error = 0.0_f64;
+            let mut yellow_error = 0.0_f64;
+            for r in 30..40 {
+                for c in 0..29 {
+                    let p = out[r * cols + c];
+                    let yellow = (c + if diagonal { r } else { 0 }) / width % 2 == 1;
+                    let expected = if yellow { 1.25_f64.ln() } else { 0.0 };
+                    let error = (p[0] / p[2] / MERRILL_PRIOR[0]).ln() - expected;
+                    if yellow {
+                        yellow_error = yellow_error.max(error.abs());
+                    } else {
+                        white_error = white_error.max(error.abs());
+                    }
+                }
+            }
+            eprintln!("stripe width={width}, diagonal={diagonal}, transpose={transpose}: white error={white_error}, yellow error={yellow_error}");
+            assert!(
+                white_error < 0.025,
+                "borrowed yellow color contaminated white stripes"
+            );
+            assert!(
+                yellow_error < 0.08,
+                "boundary handling erased colored stripes"
+            );
+        }
+    }
 
     // Minimal context for field construction/export only; not the pixel evaluator.
     fn recovery_test_context(prior: &[f64; 3]) -> super::DngCtx<'_> {

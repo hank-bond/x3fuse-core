@@ -5,6 +5,8 @@
 //! balanced pair does not establish white. The missing third-layer relationship
 //! can also belong to a colored surface. The graph has no fixed donor radius or
 //! scene classes.
+//! Cells crossing a reliable native-layer edge are refined at pixel spacing;
+//! color cannot propagate across that edge. Ordinary cells stay on the coarse grid.
 //!
 //! # Reading order
 //!
@@ -12,6 +14,7 @@
 //! - [`Field::estimate`] reads that grid to choose a color for one pixel.
 //! - [`Field::reconstruct`] coordinates the construction work called by `build`:
 //!   connect cells, assemble their color equations, solve, and store the results.
+//! - [`Field::refine_native`] solves affected edge cells using the same equations.
 //!
 //! The entry points sit below the settings. Private construction methods follow,
 //! then supporting types and math helpers. Tests are at the end.
@@ -113,6 +116,11 @@ const PAIR_ERROR_ALLOWANCE: f64 = PAIR_AGREEMENT_SCALE;
 // finer spatial sampling and create more cells for the solver to process.
 const GRID_STEP_PIXELS: usize = 8;
 
+// A 20% step in a usable native layer is a boundary for color borrowing.
+// Test before cell averaging: narrow stripes can share the same cell mean.
+// ponytail: fixed relative threshold; calibrate for sensor noise when stripe RAWs are available.
+const NATIVE_EDGE_RATIO: f64 = 1.2;
+
 // Minimum number of usable, intact pixels needed for a cell to supply boundary
 // color. Keep this positive, and review it when changing cell size because the
 // number of available measurements changes with the area of each cell.
@@ -178,6 +186,7 @@ pub(super) struct Field {
     horizontal: Vec<f64>,
     vertical: Vec<f64>,
     prior: ColorPrior,
+    native_colors: Vec<[f64; 2]>,
 }
 
 impl Field {
@@ -193,26 +202,65 @@ impl Field {
         let rows = (ctx.rows as usize).div_ceil(GRID_STEP_PIXELS);
         let cols = (ctx.cols as usize).div_ceil(GRID_STEP_PIXELS);
         let mut nodes = vec![Node::default(); rows * cols];
+        let mut native_colors = Vec::new();
+        let mut mixed_cells = vec![false; rows * cols];
+        let mut above = vec![None; ctx.cols as usize];
         let neutral = unsafe { *(ctx.prior as *const [f64; 3]) };
         let y = ctx
             .camera_y
             .ok_or(InvalidData("color field requires Merrill Y"))?;
         for r in 0..rows {
             control.check()?;
+            let mut left = [None; GRID_STEP_PIXELS];
             for c in 0..cols {
                 let n = &mut nodes[r * cols + c];
                 let mut count = 0.0;
                 let mut tones = 0.0;
                 let mut donors = 0.0;
                 let mut stressed = false;
+                let mut mixed = false;
+                let mut previous_row = [None; GRID_STEP_PIXELS];
                 for row in r * GRID_STEP_PIXELS..((r + 1) * GRID_STEP_PIXELS).min(ctx.rows as usize)
                 {
+                    let mut previous = None;
                     for col in
                         c * GRID_STEP_PIXELS..((c + 1) * GRID_STEP_PIXELS).min(ctx.cols as usize)
                     {
                         let measured = unsafe { ctx.measured(data, stride, row, col) };
                         let mask = model.mask(row, col);
                         let repaired = model.repaired_site(row, col);
+                        let sample = LayerSample {
+                            measured,
+                            mask,
+                            repaired,
+                        };
+                        let k = col % GRID_STEP_PIXELS;
+                        if k == 0
+                            && c > 0
+                            && left[row % GRID_STEP_PIXELS].is_some_and(|a| native_edge(a, sample))
+                        {
+                            mixed = true;
+                            mixed_cells[r * cols + c - 1] = true;
+                        }
+                        if row % GRID_STEP_PIXELS == 0
+                            && r > 0
+                            && above[col].is_some_and(|a| native_edge(a, sample))
+                        {
+                            mixed = true;
+                            mixed_cells[(r - 1) * cols + c] = true;
+                        }
+                        if col + 1 == ((c + 1) * GRID_STEP_PIXELS).min(ctx.cols as usize) {
+                            left[row % GRID_STEP_PIXELS] = Some(sample);
+                        }
+                        if row + 1 == ((r + 1) * GRID_STEP_PIXELS).min(ctx.rows as usize) {
+                            above[col] = Some(sample);
+                        }
+                        if !mixed {
+                            mixed = previous.is_some_and(|a| native_edge(a, sample))
+                                || previous_row[k].is_some_and(|a| native_edge(a, sample));
+                            previous = Some(sample);
+                            previous_row[k] = Some(sample);
+                        }
                         n.affected |= mask != [FULL_RELIABILITY; 3];
                         let mut tone = tone_anchor::recover_severe(measured, mask, neutral, y);
                         if let Some(g) = ctx.gradient {
@@ -266,7 +314,22 @@ impl Field {
                 if donors > 0.0 {
                     n.color = n.color.map(|v| v / donors);
                 }
+                mixed_cells[r * cols + c] |= mixed;
             }
+        }
+        for (n, mixed) in nodes.iter_mut().zip(mixed_cells) {
+            if !mixed {
+                continue;
+            }
+            if n.affected {
+                n.native_offset = native_colors.len();
+                native_colors.resize(native_colors.len() + GRID_STEP_PIXELS.pow(2), [0.0; 2]);
+            }
+            // An average of two surfaces is neither a donor nor a safe bridge.
+            // Resolve affected pixels below at native spacing, including edges
+            // that happen to coincide with coarse-cell boundaries.
+            n.fixed = false;
+            n.affected = false;
         }
         let size = nodes.len();
         let mut result = Self {
@@ -276,8 +339,12 @@ impl Field {
             horizontal: vec![0.0; size],
             vertical: vec![0.0; size],
             prior: ColorPrior::new(neutral, unsafe { *(ctx.conv_matrix as *const [f64; 9]) })?,
+            native_colors,
         };
         result.reconstruct(control)?;
+        unsafe {
+            result.refine_native(ctx, model, data, stride, control)?;
+        }
         Ok(result)
     }
 
@@ -309,30 +376,35 @@ impl Field {
         let mut sum = [0.0; 2];
         let mut total = 0.0;
         let mut distance = 0.0;
-        for r in rr.floor() as isize..=rr.floor() as isize + 1 {
-            for c in cc.floor() as isize..=cc.floor() as isize + 1 {
-                if r < 0 || c < 0 || r as usize >= self.rows || c as usize >= self.cols {
-                    continue;
+        let native = self.native_offset(row, col).map(|i| self.native_colors[i]);
+        if native.is_none() {
+            for r in rr.floor() as isize..=rr.floor() as isize + 1 {
+                for c in cc.floor() as isize..=cc.floor() as isize + 1 {
+                    if r < 0 || c < 0 || r as usize >= self.rows || c as usize >= self.cols {
+                        continue;
+                    }
+                    let n = &self.nodes[r as usize * self.cols + c as usize];
+                    if !n.distance.is_finite() && !n.affected {
+                        continue;
+                    }
+                    let w = (1.0 - (rr - r as f64).abs())
+                        * (1.0 - (cc - c as f64).abs())
+                        * affinity(guide, n.guide);
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    total += w;
+                    for (ch, value) in sum.iter_mut().enumerate() {
+                        *value += w * n.color[ch];
+                    }
+                    distance += w * n.distance;
                 }
-                let n = &self.nodes[r as usize * self.cols + c as usize];
-                if !n.distance.is_finite() && !n.affected {
-                    continue;
-                }
-                let w = (1.0 - (rr - r as f64).abs())
-                    * (1.0 - (cc - c as f64).abs())
-                    * affinity(guide, n.guide);
-                if w <= 0.0 {
-                    continue;
-                }
-                total += w;
-                for (ch, value) in sum.iter_mut().enumerate() {
-                    *value += w * n.color[ch];
-                }
-                distance += w * n.distance;
             }
         }
         let p = self.prior;
-        let (prior, distance) = if total > MIN_INTERPOLATION_WEIGHT {
+        let (prior, distance) = if let Some(color) = native {
+            (color, f64::INFINITY)
+        } else if total > MIN_INTERPOLATION_WEIGHT {
             (sum.map(|v| v / total), distance / total)
         } else {
             (p.neutral, f64::INFINITY)
@@ -353,15 +425,172 @@ impl Field {
                 std::array::from_fn(|k| prior[k] + retained * (proposed_prior[k] - prior[k])),
             )
         };
-        direction(fit, y)
-            .or_else(|| direction(prior, y))
-            .or_else(|| direction(p.neutral, y))
+        // Opposing luminance coefficients can almost cancel for a finite color
+        // direction. Accept it only if scaling to the chosen Y fits the encoder;
+        // otherwise try the existing field/neutral fallbacks before losing color
+        // to channel clipping and forcing the whole image to maximum headroom.
+        let encodable = |uv| {
+            direction(uv, y).filter(|d| d.iter().all(|v| v * target_y <= super::DNG_MAX_HEADROOM))
+        };
+        encodable(fit)
+            .or_else(|| encodable(prior))
+            .or_else(|| encodable(p.neutral))
     }
 }
 
 // Field construction
 
 impl Field {
+    fn native_offset(&self, row: usize, col: usize) -> Option<usize> {
+        let offset =
+            self.nodes[(row / GRID_STEP_PIXELS) * self.cols + col / GRID_STEP_PIXELS].native_offset;
+        (offset != NONE)
+            .then(|| offset + (row % GRID_STEP_PIXELS) * GRID_STEP_PIXELS + col % GRID_STEP_PIXELS)
+    }
+
+    /// Refine only cells that straddle a native edge. Reuse the color equations
+    /// and solver, with intact native pixels as boundaries and zero coupling
+    /// across detected edges. Store the result before either encoding pass.
+    unsafe fn refine_native(
+        &mut self,
+        ctx: &DngCtx<'_>,
+        model: &LocalRecovery,
+        data: &[u16],
+        stride: usize,
+        control: Control<'_>,
+    ) -> crate::Result<()> {
+        if self.native_colors.is_empty() {
+            return Ok(());
+        }
+        let neutral = unsafe { *(ctx.prior as *const [f64; 3]) };
+        let y = ctx
+            .camera_y
+            .ok_or(InvalidData("native color requires Merrill Y"))?;
+        let source = |row, col| {
+            let measured = unsafe { ctx.measured(data, stride, row, col) };
+            let mask = model.mask(row, col);
+            let repaired = model.repaired_site(row, col);
+            let mut tone = tone_anchor::recover_severe(measured, mask, neutral, y);
+            if let Some(g) = ctx.gradient {
+                g.apply(row, col, &mut tone, measured, neutral);
+            }
+            let target = if tone.available {
+                tone.amplitude * dot3(y, neutral)
+            } else {
+                dot3(y, measured)
+            };
+            let (pair, q) = evidence(measured, mask, repaired);
+            NativeSource {
+                layers: LayerSample {
+                    measured,
+                    mask,
+                    repaired,
+                },
+                guide: Guide {
+                    pair,
+                    q,
+                    tone: if target > MIN_CELL_LUMINANCE {
+                        target.ln()
+                    } else {
+                        f64::NAN
+                    },
+                },
+            }
+        };
+        let mut index = vec![NONE; self.native_colors.len()];
+        let mut positions = Vec::new();
+        let mut sources = Vec::new();
+        for (i, cell) in self.nodes.iter().enumerate() {
+            if i % (CANCEL_CHECK_INTERVAL / GRID_STEP_PIXELS.pow(2)) == 0 {
+                control.check()?;
+            }
+            if cell.native_offset == NONE {
+                continue;
+            }
+            let top = (i / self.cols) * GRID_STEP_PIXELS;
+            let left = (i % self.cols) * GRID_STEP_PIXELS;
+            for row in top..(top + GRID_STEP_PIXELS).min(ctx.rows as usize) {
+                for col in left..(left + GRID_STEP_PIXELS).min(ctx.cols as usize) {
+                    let offset = cell.native_offset + (row - top) * GRID_STEP_PIXELS + col - left;
+                    let s = source(row, col);
+                    let donor = s.donor();
+                    self.native_colors[offset] = donor.unwrap_or(self.prior.neutral);
+                    if donor.is_none() && s.guide.tone.is_finite() {
+                        index[offset] = sources.len();
+                        positions.push((row, col));
+                        sources.push(s);
+                    }
+                }
+            }
+        }
+        let mut equations = Vec::with_capacity(sources.len());
+        let mut rhs = Vec::with_capacity(sources.len());
+        // Preserve the coarse field's spatial regularization per unit area.
+        let area_scale = 1.0 / GRID_STEP_PIXELS.pow(2) as f64;
+        for (i, &(row, col)) in positions.iter().enumerate() {
+            if i % 4096 == 0 {
+                control.check()?;
+            }
+            let a = sources[i];
+            let (block, target) = data_equation(a.guide);
+            let mut block = block.map(|v| v * area_scale);
+            let mut target = target.map(|v| v * area_scale);
+            self.prior.add(
+                &mut block,
+                &mut target,
+                self.prior.neutral,
+                neutral_weight(a.guide) * area_scale,
+            );
+            let mut neighbors = [NONE; 4];
+            let mut weights = [0.0; 4];
+            for (k, (dr, dc)) in [(-1, 0), (1, 0), (0, -1), (0, 1)].into_iter().enumerate() {
+                let r = row as isize + dr;
+                let c = col as isize + dc;
+                if r < 0 || c < 0 || r >= ctx.rows as isize || c >= ctx.cols as isize {
+                    continue;
+                }
+                let (r, c) = (r as usize, c as usize);
+                let offset = self.native_offset(r, c);
+                let j = offset.map_or(NONE, |n| index[n]);
+                let b = if j == NONE { source(r, c) } else { sources[j] };
+                if native_edge(a.layers, b.layers) {
+                    continue;
+                }
+                let w = affinity(a.guide, b.guide);
+                if w == 0.0 {
+                    continue;
+                }
+                let color = if j != NONE {
+                    neighbors[k] = j;
+                    weights[k] = w;
+                    [0.0; 2]
+                } else if let Some(color) = b.donor() {
+                    color
+                } else {
+                    let n = &self.nodes[(r / GRID_STEP_PIXELS) * self.cols + c / GRID_STEP_PIXELS];
+                    if offset.is_some() || (!n.fixed && !n.affected) {
+                        continue;
+                    }
+                    n.color
+                };
+                self.prior.add(&mut block, &mut target, color, w);
+            }
+            equations.push(Equation {
+                block,
+                neighbors,
+                weights,
+            });
+            rhs.push(target);
+        }
+        let mut colors = vec![self.prior.neutral; sources.len()];
+        solve_components(&equations, self.prior.metric, &rhs, &mut colors, control)?;
+        for (i, &(row, col)) in positions.iter().enumerate() {
+            let offset = self.native_offset(row, col).unwrap();
+            self.native_colors[offset] = colors[i];
+        }
+        control.check()
+    }
+
     fn reconstruct(&mut self, control: Control<'_>) -> crate::Result<()> {
         self.connect(control)?;
         let mut index = vec![NONE; self.nodes.len()];
@@ -578,6 +807,48 @@ impl Field {
 fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
     a.into_iter().zip(b).map(|(x, y)| x * y).sum()
 }
+
+#[derive(Clone, Copy)]
+struct LayerSample {
+    measured: [f64; 3],
+    mask: [u8; 3],
+    repaired: bool,
+}
+
+fn native_edge(a: LayerSample, b: LayerSample) -> bool {
+    if a.repaired || b.repaired {
+        return false;
+    }
+    (0..3).any(|c| {
+        let (x, y) = (a.measured[c], b.measured[c]);
+        a.mask[c] == FULL_RELIABILITY
+            && b.mask[c] == FULL_RELIABILITY
+            && x.is_finite()
+            && y.is_finite()
+            && x.min(y) > MIN_DONOR_SIGNAL
+            && x.max(y) > NATIVE_EDGE_RATIO * x.min(y)
+    })
+}
+
+#[derive(Clone, Copy)]
+struct NativeSource {
+    layers: LayerSample,
+    guide: Guide,
+}
+
+impl NativeSource {
+    fn donor(self) -> Option<[f64; 2]> {
+        (!self.layers.repaired
+            && self.layers.mask == [FULL_RELIABILITY; 3]
+            && self
+                .layers
+                .measured
+                .iter()
+                .all(|v| v.is_finite() && *v > MIN_DONOR_SIGNAL)
+            && self.guide.tone.is_finite())
+        .then_some([self.guide.pair[1], self.guide.pair[2]])
+    }
+}
 fn smooth(x: f64) -> f64 {
     // The fixed cubic coefficients give zero slope at both endpoints.
     let x = x.clamp(0.0, 1.0);
@@ -719,6 +990,7 @@ struct Node {
     origin: usize,
     affected: bool,
     region: usize,
+    native_offset: usize,
 }
 impl Default for Node {
     fn default() -> Self {
@@ -730,6 +1002,7 @@ impl Default for Node {
             origin: NONE,
             affected: false,
             region: NONE,
+            native_offset: NONE,
         }
     }
 }
@@ -885,6 +1158,56 @@ fn solve(
     }
     unreachable!()
 }
+
+// Edge cuts often leave thousands of small independent regions. Solve each on
+// its own so a difficult region does not keep every other pixel iterating.
+fn solve_components(
+    rows: &[Equation],
+    metric: [f64; 3],
+    rhs: &[[f64; 2]],
+    x: &mut [[f64; 2]],
+    control: Control<'_>,
+) -> crate::Result<()> {
+    let mut index = vec![NONE; rows.len()];
+    for start in 0..rows.len() {
+        if index[start] != NONE {
+            continue;
+        }
+        control.check()?;
+        let mut component = vec![start];
+        index[start] = 0;
+        let mut k = 0;
+        while k < component.len() {
+            if k % CANCEL_CHECK_INTERVAL == 0 {
+                control.check()?;
+            }
+            for j in rows[component[k]].neighbors {
+                if j != NONE && index[j] == NONE {
+                    index[j] = component.len();
+                    component.push(j);
+                }
+            }
+            k += 1;
+        }
+        let local: Vec<_> = component
+            .iter()
+            .map(|&i| Equation {
+                block: rows[i].block,
+                neighbors: rows[i]
+                    .neighbors
+                    .map(|j| if j == NONE { NONE } else { index[j] }),
+                weights: rows[i].weights,
+            })
+            .collect();
+        let b: Vec<_> = component.iter().map(|&i| rhs[i]).collect();
+        let mut values: Vec<_> = component.iter().map(|&i| x[i]).collect();
+        solve(&local, metric, &b, &mut values, control)?;
+        for (i, value) in component.into_iter().zip(values) {
+            x[i] = value;
+        }
+    }
+    Ok(())
+}
 fn data_equation(g: Guide) -> ([f64; 3], [f64; 2]) {
     let [a, b, c] = g.q.map(|v| v * PAIR_DATA_WEIGHT);
     (
@@ -915,6 +1238,34 @@ mod tests {
     const M: [f64; 9] = [
         4.45774, -1.90728, 0.581922, -4.22818, 4.30012, -0.701463, 3.1376, -5.81127, 3.31683,
     ];
+    #[test]
+    fn native_edges_require_reliable_signal_in_the_same_layer() {
+        let a = LayerSample {
+            measured: [0.25, 0.5, 1.0],
+            mask: [255, 255, 0],
+            repaired: false,
+        };
+        let mut b = a;
+        b.measured[0] *= 1.25;
+        assert!(native_edge(a, b) && native_edge(b, a));
+        b.mask[0] = 254;
+        assert!(!native_edge(a, b));
+        b.mask = a.mask;
+        b.repaired = true;
+        assert!(!native_edge(a, b));
+        b = a;
+        b.measured[2] = 2.0; // A clipped layer supplies no boundary evidence.
+        assert!(!native_edge(a, b));
+        b = a;
+        b.measured = a.measured.map(|v| v * 1.02); // Smooth exposure ramp.
+        assert!(!native_edge(a, b));
+        let dark = LayerSample {
+            measured: [0.001; 3],
+            mask: [255; 3],
+            repaired: false,
+        };
+        assert!(!native_edge(dark, a));
+    }
     fn line(length: usize) -> Field {
         let prior = ColorPrior::new(P, M).unwrap();
         let g = Guide {
@@ -935,6 +1286,7 @@ mod tests {
             horizontal: vec![0.0; length],
             vertical: vec![0.0; length],
             prior,
+            native_colors: Vec::new(),
         };
         f.nodes[0].fixed = true;
         f.nodes[0].affected = false;

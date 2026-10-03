@@ -104,6 +104,12 @@ signal remains, it uses brightness calculated from the camera calibration. When
 at least two layers have low reliability, it shifts toward an estimate from the
 remaining measurements.
 
+Camera luminance can approach zero through cancellation between positive and
+negative calibration coefficients. The matrix anchor loses influence smoothly
+near that boundary. Severe recovery blends from the complete previous estimate,
+including its strength, so a one-step reliability change cannot switch an
+unusable matrix anchor directly to a full-strength dark result.
+
 Where all layers are clipped, the method can estimate a neutral brightness from
 the recorded levels, but those levels provide no measured texture. The estimate
 is an assumption about brightness, not a physical measurement of the missing light.
@@ -156,6 +162,20 @@ a much darker surface is not sufficient evidence for borrowing its color.
 Unaffected low-signal cells cannot connect unrelated donors. These checks limit
 color transfer, but they do not identify surfaces or materials.
 
+Before averaging cells, the stage checks adjacent native pixels for a signal
+step greater than 20% in a layer that is fully reliable on both sides. Dark
+measurements and repaired pixels cannot establish an edge. Cells touching these
+edges do not donate their mixed color or connect the coarse field. Affected
+edge cells instead use the same color equations at native resolution, with no
+neighbor contribution across detected edges. This lets thin stripes borrow
+color along their length without averaging with a neighboring white stripe.
+Ordinary cells retain the coarse calculation.
+
+This is a relative signal threshold, not material recognition. A sharp lighting
+change can also stop color borrowing, while a weak edge or one hidden by clipping
+may remain undetected. A stripe still needs surviving color evidence; a boundary
+alone cannot determine its missing hue.
+
 A *neutral prior* adds a soft constraint toward the neutral layer ratios from the
 camera calibration. The constraint is strongest where pair evidence is absent,
 but it does not classify a balanced pair as white. Regions without reachable
@@ -188,12 +208,19 @@ of measured evidence. It is a heuristic, not a calibrated noise interval or a te
 for white surfaces.
 
 The color stage scales the fitted direction to the reconstructed brightness,
-using luminance from the camera calibration. Layer ratios are soft constraints,
+using luminance from the camera calibration. A direction whose nearly cancelled
+luminance would require a layer above the encoder's 16-times headroom is rejected;
+the stage tries the field direction, then calibrated neutral, retaining the tone
+estimate if neither fits. Layer ratios are soft constraints,
 not promises to retain absolute surviving-layer values alongside an independently
 reconstructed brightness. Recovery strength increases smoothly as layer reliability
 falls. The stage applies this blend once, not once per reconstruction step. Fully
 reliable pixels retain their normalized sensor samples before shared output
 scaling and 16-bit encoding.
+
+`X3F_NO_CHROMA_LUT=1` disables the Merrill color field as well as the legacy
+lookup-table color reconstruction. The Merrill brightness stages still run when
+recovery is enabled. The override does not enable recovery on its own.
 
 Headroom measurement and encoding read the same immutable color field. The solver
 checks cancellation and recomputes the equation error before accepting its result.

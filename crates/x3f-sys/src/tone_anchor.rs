@@ -58,6 +58,11 @@ fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a.into_iter().zip(b).map(|(a, b)| a * b).sum()
 }
 
+fn smooth(x: f64) -> f64 {
+    let x = x.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
 fn recover_luminance(measured: [f64; 3], mask: [u8; 3], neutral: [f64; 3], y: [f64; 3]) -> Result {
     let mut result = recover(measured, mask, neutral);
     if !result.available {
@@ -79,6 +84,12 @@ fn recover_luminance(measured: [f64; 3], mask: [u8; 3], neutral: [f64; 3], y: [f
         };
     }
     let amplitude = target_y / neutral_y;
+    // Fade a nearly cancelled matrix anchor out before Y reaches zero. Its
+    // strength must meet the unavailable (nonpositive Y) case continuously.
+    // Full confidence returns at 1/16 of the surviving-layer tone estimate.
+    if result.amplitude > 0.0 {
+        result.strength *= smooth(16.0 * amplitude / result.amplitude);
+    }
     result.samples = std::array::from_fn(|c| {
         if result.strength == 1.0 {
             amplitude * neutral[c]
@@ -112,12 +123,8 @@ pub(super) fn recover_severe(
     if !neutral_y.is_finite() || neutral_y <= 1e-12 || !measured_y.is_finite() {
         return hold;
     }
-    let h = |x: f64| {
-        let x = x.clamp(0.0, 1.0);
-        x * x * (3.0 - 2.0 * x)
-    };
-    let severity = h(1.0 - 2.0 * sorted[1] as f64 / 255.0);
-    let trust = h(2.0 * sorted[2] as f64 / 255.0);
+    let severity = smooth(1.0 - 2.0 * sorted[1] as f64 / 255.0);
+    let trust = smooth(2.0 * sorted[2] as f64 / 255.0);
     let amplitudes: [f64; 3] = std::array::from_fn(|c| measured[c] / neutral[c]);
     let envelope = amplitudes.into_iter().fold(0.0_f64, f64::max);
     let weights = mask.map(|v| (v as f64 / 255.0).powi(2));
@@ -128,20 +135,31 @@ pub(super) fn recover_severe(
         envelope
     };
     let guarded = trust * mean + (1.0 - trust) * envelope;
-    // Severe clipping can make matrix luminance negative. A zero floor
-    // prevents that value from reducing the layer-based brightness estimate
-    // and keeps the blend continuous at zero luminance.
-    let held = (measured_y / neutral_y).max(0.0);
-    let amplitude = held + severity * (guarded - held);
+    // Blend the complete hold result into the severe estimate. An unavailable
+    // matrix anchor has zero strength, so crossing half reliability cannot
+    // suddenly replace the source with a nearly black, full-strength target.
+    let strength = hold.strength + severity * (1.0 - hold.strength);
+    if strength <= 0.0 {
+        return hold;
+    }
+    let amplitude = if hold.strength == 1.0 {
+        hold.amplitude + severity * (guarded - hold.amplitude)
+    } else {
+        ((1.0 - severity) * hold.strength * hold.amplitude + severity * guarded) / strength
+    };
     if !amplitude.is_finite() || amplitude <= 0.0 {
         return hold;
     }
-    // With two layers below half reliability, recovery strength is exactly one.
-    // Include fully clipped pixels so the estimate remains continuous.
     Result {
-        samples: neutral.map(|v| amplitude * v),
+        samples: std::array::from_fn(|c| {
+            if strength == 1.0 {
+                amplitude * neutral[c]
+            } else {
+                measured[c] + strength * (amplitude * neutral[c] - measured[c])
+            }
+        }),
         amplitude,
-        strength: 1.0,
+        strength,
         available: true,
     }
 }
@@ -246,7 +264,7 @@ mod tests {
             [17250.0 / 65535.0, 15160.0 / 65535.0, 16071.0 / 65535.0],
         ] {
             assert!(dot(y, s) < 0.0);
-            for mask in [[0; 3], [255, 0, 0], [1, 1, 0], [255, 127, 0]] {
+            for mask in [[0; 3], [255, 0, 0]] {
                 let r = recover_severe(s, mask, p, y);
                 assert!(r.available && r.amplitude > 0.0);
                 close(r.strength, 1.0);
@@ -254,9 +272,7 @@ mod tests {
                 for c in 0..3 {
                     close(r.samples[c], r.amplitude * p[c]);
                 }
-                if mask == [0; 3] || mask == [255, 0, 0] {
-                    close(r.amplitude, s[0] / p[0]);
-                }
+                close(r.amplitude, s[0] / p[0]);
             }
             for mask in [[255; 3], [255, 255, 0], [128; 3]] {
                 let r = recover_severe(s, mask, p, y);
@@ -269,7 +285,14 @@ mod tests {
     #[test]
     fn severe_is_continuous_across_zero_matrix_luminance() {
         let s = [0.8, -(Y[0] * 0.8 + Y[2]) / Y[1], 1.0];
-        for mask in [[0; 3], [255, 0, 0], [255, 64, 0], [255, 127, 0]] {
+        for mask in [
+            [0; 3],
+            [255, 0, 0],
+            [255, 64, 0],
+            [255, 127, 0],
+            [255, 128, 0],
+            [255, 255, 0],
+        ] {
             let mut low = s;
             let mut high = s;
             low[1] -= 1e-9;
@@ -277,8 +300,10 @@ mod tests {
             assert!(dot(Y, low) < 0.0 && dot(Y, high) > 0.0);
             let a = recover_severe(low, mask, P, Y);
             let b = recover_severe(high, mask, P, Y);
-            assert!(a.available && b.available);
-            assert!((a.amplitude - b.amplitude).abs() < 1e-7);
+            for c in 0..3 {
+                assert!((a.samples[c] - b.samples[c]).abs() < 1e-7);
+            }
+            assert!((a.strength - b.strength).abs() < 1e-7);
         }
     }
 

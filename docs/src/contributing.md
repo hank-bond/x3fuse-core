@@ -274,6 +274,26 @@ manual baseline table from guesses or from recovery-enabled runs: measure
 the exact documented recovery-off commands, and record intentional changes
 separately from stale historical file hashes.
 
+The PR #23 follow-up guards color directions against nearly cancelled camera
+luminance, blends invalid tone anchors continuously at the severe-recovery
+threshold, restores `X3F_NO_CHROMA_LUT`, and refines color at native signal edges.
+Synthetic tests cover white/yellow stripes from one to eight pixels wide,
+horizontal and diagonal boundaries, partial grid cells, unchanged reliable
+pixels, and brightness preservation. Edge detection is a fixed relative-signal
+heuristic; the requester's striped RAW is still needed for photographic validation.
+
+Measured recovery-enabled baseline with `-dng -no-denoise -dng-highlight-recovery`
+(default linear mapping, no `X3F_*` research overrides):
+
+| Input | PR #23 (`c476a26`) MD5 | With the follow-up MD5 |
+| --- | --- | --- |
+| `DP2M0981.X3F` | `47f35ba23b24ad78515557b8ddd491f7` | `e2184832f462cb4a196c54799b844b27` |
+
+The existing recovery-off table is not repinned for this change. With the local
+`DP2M0981.X3F` and `DP0Q0010.X3F` fixtures, recovery-off DNG and TIFF bytes match
+main (`00d326f`), as does recovery-enabled Quattro DNG. The three manual reference
+files above were unavailable; their hashes were not inferred from these fixtures.
+
 Include matrix-pathology cases when validating older sensors. Foveon layers can
 retain nominal headroom while their combined color projection is already
 unreliable, so a hard-clipping mask alone is insufficient. Exercise
