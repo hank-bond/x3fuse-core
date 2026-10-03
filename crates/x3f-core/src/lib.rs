@@ -150,6 +150,12 @@ pub struct ProcessOptions {
     /// default DNG profile, regardless of camera model. Leaves calibration,
     /// raw samples, and the thumbnail unchanged. Defaults to `None`.
     pub dng_look: Option<std::path::PathBuf>,
+    /// Generate Standard look and tone metadata for DP2 Merrill DNG output.
+    /// Require Daylight or Sunlight and linear highlight mapping. Leave camera
+    /// samples, calibration, exposure metadata, and generated previews unchanged.
+    /// Defaults to `false`. Cannot be combined with an imported DCP look.
+    /// Does not enable recovery or change denoising and bad-pixel repair options.
+    pub dng_spp_standard: bool,
     /// Estimate missing highlight brightness and color when writing DNG.
     /// Defaults to `false`. Merrill uses gradient-based reconstruction.
     /// Older cameras and Quattro use separate reconstruction paths.
@@ -211,6 +217,7 @@ impl Default for ProcessOptions {
             denoise_intensity: 10,
             opcodes_dir: None,
             dng_look: None,
+            dng_spp_standard: false,
             dng_highlight_recovery: false,
             dng_recovery_mask: None,
             dng_highlight_mapping: DngHighlightMapping::default(),
