@@ -60,6 +60,7 @@ struct Args {
     outdir: Option<PathBuf>,
     opcodes_dir: Option<PathBuf>,
     dng_look: Option<PathBuf>,
+    dng_spp_standard: bool,
     files: Vec<PathBuf>,
     verbosity: Option<Verbosity>,
     legacy_offset: Option<i32>,
@@ -93,6 +94,7 @@ impl Default for Args {
             outdir: None,
             opcodes_dir: None,
             dng_look: None,
+            dng_spp_standard: false,
             files: Vec::new(),
             verbosity: None,
             legacy_offset: None,
@@ -147,6 +149,7 @@ fn usage(progname: &str) -> ! {
          \x20                  per-(model, aperture[, lens]) blob is embedded\n\
          \x20                  into the DNG raw IFD's OpcodeList3 tag. Files\n\
          \x20                  follow the x3fuse layout: <MODEL>[_<LENS>]_FF_DNG_Opcodelist3_<APERTURE>.\n\
+         \x20  -dng-spp-standard Experimental DP2 Merrill Daylight Standard rendering metadata.\n\
          \x20  -dng-look <FILE> Embed a DCP look table and tone curve in the DNG.\n\
          \x20                  Leaves calibration and the thumbnail unchanged.\n\
          \x20  -dng-highlight-recovery\n\
@@ -322,6 +325,7 @@ fn parse_args(argv: &[String]) -> Args {
                 let v = argv.get(i).unwrap_or_else(|| usage(progname));
                 args.dng_look = Some(PathBuf::from(v));
             }
+            "-dng-spp-standard" => args.dng_spp_standard = true,
             "-dng-highlight-recovery" => args.dng_highlight_recovery = true,
             "-dng-recovery-mask" => args.dng_recovery_mask = true,
             "-dng-highlight-mapping" => {
@@ -379,6 +383,13 @@ fn normalize(args: &mut Args) {
 /// usage()-style exit. Kept as a pure function so the unit tests can
 /// exercise it without `process::exit`.
 fn validate_args(args: &Args) -> Result<(), String> {
+    if args.dng_spp_standard
+        && (args.file_type != FileType::Dng
+            || args.dng_look.is_some()
+            || args.dng_highlight_mapping != DngHighlightMapping::Linear)
+    {
+        return Err("-dng-spp-standard requires DNG, linear mapping and no -dng-look".into());
+    }
     if args.dng_look.is_some() && args.file_type != FileType::Dng {
         return Err("-dng-look requires DNG output".into());
     }
@@ -519,6 +530,7 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         compress: args.compress,
         opcodes_dir: args.opcodes_dir.clone(),
         dng_look: args.dng_look.clone(),
+        dng_spp_standard: args.dng_spp_standard,
         dng_highlight_recovery: args.dng_highlight_recovery,
         dng_recovery_mask: args
             .dng_recovery_mask
@@ -772,6 +784,24 @@ mod tests {
         assert_eq!(a.color_encoding, ColorEncoding::Unprocessed);
         let a = parse(&["-color", "sRGB", "-qtop", "in.X3F"]);
         assert_eq!(a.color_encoding, ColorEncoding::Qtop);
+    }
+
+    #[test]
+    fn spp_standard_is_opt_in_and_exclusive() {
+        assert!(!parse(&["in.X3F"]).dng_spp_standard);
+        assert!(validate_args(&parse(&["-dng-spp-standard", "in.X3F"])).is_ok());
+        for flags in [
+            vec!["-tiff", "-dng-spp-standard", "in.X3F"],
+            vec!["-dng-spp-standard", "-dng-look", "look.dcp", "in.X3F"],
+            vec![
+                "-dng-spp-standard",
+                "-dng-highlight-mapping",
+                "shoulder",
+                "in.X3F",
+            ],
+        ] {
+            assert!(validate_args(&parse(&flags)).is_err());
+        }
     }
 
     #[test]

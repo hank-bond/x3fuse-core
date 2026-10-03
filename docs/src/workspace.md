@@ -114,6 +114,8 @@ Submodules:
   per-conversion `ProcessingInfo`. The wrapper also checks that
   conversion's recovery-mask export result.
 
+The Standard DNG recipe uses [`output/dng/spp_standard.rs`](../../crates/x3f-core/src/output/dng/spp_standard.rs) for calibration and profile embedding. Its `tone` module builds the native tone and Adobe tone representations, `color_dq` applies the pointwise color correction, and `look` bakes the color residual. Each module declares its algorithm constants and numerical limits before its entry points.
+
 ## `crates/x3f-cli`
 
 Hand-rolled argument parser plus a `convert_one` per file. Single-dash

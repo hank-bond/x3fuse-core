@@ -34,6 +34,7 @@ mod ljpeg;
 pub(crate) mod metadata;
 mod opcodes;
 mod profiles;
+mod spp_standard;
 mod strip;
 pub(crate) mod tags;
 pub(crate) mod tiff_writer;
@@ -92,6 +93,14 @@ pub(crate) fn write_controlled(
         check_mask_destination(path, mask)?;
     }
 
+    if opts.dng_spp_standard
+        && (opts.dng_look.is_some()
+            || opts.dng_highlight_mapping != crate::DngHighlightMapping::Linear)
+    {
+        return Err(Error::InvalidData(
+            "SPP Standard experiment requires linear mapping and no imported look".into(),
+        ));
+    }
     let look = opts
         .dng_look
         .as_ref()
@@ -121,6 +130,11 @@ pub(crate) fn write_controlled(
     let calibration =
         ColorCalibration::new(reader, &wb).ok_or(Error::Library(crate::LibraryError::Argument))?;
 
+    let spp = if opts.dng_spp_standard {
+        Some(spp_standard::SppStandard::prepare(reader, &wb, control)?)
+    } else {
+        None
+    };
     let mut image = reader.get_image_with_control(&opts, control)?;
     on_write();
     control.check()?;
@@ -322,6 +336,16 @@ pub(crate) fn write_controlled(
     }
     if let Some(look) = look {
         look.embed(&mut ifd0);
+    }
+    if let Some(spp) = spp {
+        spp.embed(
+            reader,
+            &wb,
+            &calibration,
+            highlight_scale,
+            &mut ifd0,
+            control,
+        )?;
     }
     if !extra_offsets_abs.is_empty() {
         ifd0.add(tags::EXTRA_CAMERA_PROFILES, Value::Long(extra_offsets_abs));
