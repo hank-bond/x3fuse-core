@@ -1,4 +1,4 @@
-//! Generate the Standard tone response and its Adobe profile representation.
+//! Generate a color-mode tone response and its Adobe profile representation.
 //!
 //! Native tone applies independently to each channel. Adobe instead maps the
 //! lowest and highest channels, then interpolates the middle channel. Inverse
@@ -34,19 +34,35 @@ const EXPOSURE_SLOPE_OFFSET: f64 = 0.5;
 const INVERSE_EXPOSURE_STEPS: usize = 48;
 const NEUTRAL_SPAN_EPSILON: f64 = 1e-12;
 
-/// Generate the normal Standard branch from five CAMF tone-shape parameters.
-pub(super) fn native_tone(p: [f64; 5]) -> Vec<f64> {
-    let [start, end, steep1, breakpoint, steep2] = p;
+/// CAMF shape values after the selected mode's contrast compensation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ToneShape {
+    pub start: f64,
+    pub end: f64,
+    pub lower_steepness: f64,
+    pub breakpoint: f64,
+    pub upper_steepness: f64,
+}
+
+/// Generate the normal color branch from the selected CAMF tone shape.
+pub(super) fn native_tone(shape: ToneShape) -> Vec<f64> {
+    let ToneShape {
+        start,
+        end,
+        lower_steepness,
+        breakpoint,
+        upper_steepness,
+    } = shape;
     let join = (breakpoint * SATURATION as f64).ceil() as usize;
     let warped =
         |i: usize| start + (end - start) * (i as f64 / SATURATION as f64).powf(1.0 / INPUT_WARP);
     let sigmoid = |steep: f64, i: usize| 1.0 / (1.0 + (-steep * warped(i)).exp());
-    let delta = sigmoid(steep1, join) - sigmoid(steep2, join);
+    let delta = sigmoid(lower_steepness, join) - sigmoid(upper_steepness, join);
     let raw = |i: usize| {
         if i < join {
-            sigmoid(steep1, i) as f32
+            sigmoid(lower_steepness, i) as f32
         } else {
-            (sigmoid(steep2, i) + delta) as f32
+            (sigmoid(upper_steepness, i) + delta) as f32
         }
     };
     let mut controls: Vec<f32> = (0..=SATURATION).step_by(CONTROL_STEP).map(raw).collect();
@@ -159,13 +175,13 @@ fn inverse_tone(tone: &[f64], y: f64) -> f64 {
 mod tests {
     use super::*;
 
-    const STANDARD: [f64; 5] = [
-        -1.17_f32 as f64,
-        1.65_f32 as f64,
-        3.0,
-        0.1_f32 as f64,
-        1.7_f32 as f64,
-    ];
+    const STANDARD: ToneShape = ToneShape {
+        start: -1.17_f32 as f64,
+        end: 1.65_f32 as f64,
+        lower_steepness: 3.0,
+        breakpoint: 0.1_f32 as f64,
+        upper_steepness: 1.7_f32 as f64,
+    };
 
     #[test]
     fn normal_tone_matches_saved_native_standard_samples() {

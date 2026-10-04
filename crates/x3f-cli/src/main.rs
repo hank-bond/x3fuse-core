@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use x3f_core::{set_max_printed_matrix_elements, set_offset_legacy, set_verbosity};
-use x3f_core::{ColorEncoding, DngHighlightMapping, ProcessOptions, Reader, Verbosity};
+use x3f_core::{ColorEncoding, DngHighlightMapping, ProcessOptions, Reader, SppMode, Verbosity};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum FileType {
@@ -60,7 +60,7 @@ struct Args {
     outdir: Option<PathBuf>,
     opcodes_dir: Option<PathBuf>,
     dng_look: Option<PathBuf>,
-    dng_spp_standard: bool,
+    dng_spp_mode: Option<SppMode>,
     files: Vec<PathBuf>,
     verbosity: Option<Verbosity>,
     legacy_offset: Option<i32>,
@@ -94,7 +94,7 @@ impl Default for Args {
             outdir: None,
             opcodes_dir: None,
             dng_look: None,
-            dng_spp_standard: false,
+            dng_spp_mode: None,
             files: Vec::new(),
             verbosity: None,
             legacy_offset: None,
@@ -149,7 +149,9 @@ fn usage(progname: &str) -> ! {
          \x20                  per-(model, aperture[, lens]) blob is embedded\n\
          \x20                  into the DNG raw IFD's OpcodeList3 tag. Files\n\
          \x20                  follow the x3fuse layout: <MODEL>[_<LENS>]_FF_DNG_Opcodelist3_<APERTURE>.\n\
-         \x20  -dng-spp-standard Experimental DP2 Merrill Daylight Standard rendering metadata.\n\
+         \x20  -dng-spp-mode <MODE> CAMF rendering for DP1, DP2 and DP3 Merrill.\n\
+         \x20                  Standard, Neutral, Vivid, Portrait, Landscape or FCBlue.\n\
+         \x20                  WB: Auto, Daylight or Sunlight. Source: sRGB or AdobeRGB.\n\
          \x20  -dng-look <FILE> Embed a DCP look table and tone curve in the DNG.\n\
          \x20                  Leaves calibration and the thumbnail unchanged.\n\
          \x20  -dng-highlight-recovery\n\
@@ -325,7 +327,14 @@ fn parse_args(argv: &[String]) -> Args {
                 let v = argv.get(i).unwrap_or_else(|| usage(progname));
                 args.dng_look = Some(PathBuf::from(v));
             }
-            "-dng-spp-standard" => args.dng_spp_standard = true,
+            "-dng-spp-mode" => {
+                i += 1;
+                let value = argv.get(i).unwrap_or_else(|| usage(progname));
+                args.dng_spp_mode = Some(value.parse().unwrap_or_else(|error| {
+                    eprintln!("{error}");
+                    usage(progname);
+                }));
+            }
             "-dng-highlight-recovery" => args.dng_highlight_recovery = true,
             "-dng-recovery-mask" => args.dng_recovery_mask = true,
             "-dng-highlight-mapping" => {
@@ -383,12 +392,12 @@ fn normalize(args: &mut Args) {
 /// usage()-style exit. Kept as a pure function so the unit tests can
 /// exercise it without `process::exit`.
 fn validate_args(args: &Args) -> Result<(), String> {
-    if args.dng_spp_standard
+    if args.dng_spp_mode.is_some()
         && (args.file_type != FileType::Dng
             || args.dng_look.is_some()
             || args.dng_highlight_mapping != DngHighlightMapping::Linear)
     {
-        return Err("-dng-spp-standard requires DNG, linear mapping and no -dng-look".into());
+        return Err("-dng-spp-mode requires DNG, linear mapping and no -dng-look".into());
     }
     if args.dng_look.is_some() && args.file_type != FileType::Dng {
         return Err("-dng-look requires DNG output".into());
@@ -530,7 +539,7 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         compress: args.compress,
         opcodes_dir: args.opcodes_dir.clone(),
         dng_look: args.dng_look.clone(),
-        dng_spp_standard: args.dng_spp_standard,
+        dng_spp_mode: args.dng_spp_mode,
         dng_highlight_recovery: args.dng_highlight_recovery,
         dng_recovery_mask: args
             .dng_recovery_mask
@@ -787,20 +796,41 @@ mod tests {
     }
 
     #[test]
-    fn spp_standard_is_opt_in_and_exclusive() {
-        assert!(!parse(&["in.X3F"]).dng_spp_standard);
-        assert!(validate_args(&parse(&["-dng-spp-standard", "in.X3F"])).is_ok());
-        for flags in [
-            vec!["-tiff", "-dng-spp-standard", "in.X3F"],
-            vec!["-dng-spp-standard", "-dng-look", "look.dcp", "in.X3F"],
-            vec![
-                "-dng-spp-standard",
-                "-dng-highlight-mapping",
-                "shoulder",
-                "in.X3F",
-            ],
+    fn spp_modes_are_opt_in_and_exclusive() {
+        assert!(parse(&["in.X3F"]).dng_spp_mode.is_none());
+        for mode in [
+            SppMode::Standard,
+            SppMode::Neutral,
+            SppMode::Vivid,
+            SppMode::Portrait,
+            SppMode::Landscape,
+            SppMode::FcBlue,
         ] {
-            assert!(validate_args(&parse(&flags)).is_err());
+            let args = parse(&["-dng-spp-mode", mode.as_str(), "in.X3F"]);
+            assert_eq!(args.dng_spp_mode, Some(mode));
+            assert!(validate_args(&args).is_ok());
+            assert!(!args.dng_highlight_recovery);
+            assert_eq!(args.denoise_intensity, Args::default().denoise_intensity);
+            assert_eq!(args.fix_bad, Args::default().fix_bad);
+            for flags in [
+                vec!["-tiff", "-dng-spp-mode", mode.as_str(), "in.X3F"],
+                vec![
+                    "-dng-spp-mode",
+                    mode.as_str(),
+                    "-dng-look",
+                    "look.dcp",
+                    "in.X3F",
+                ],
+                vec![
+                    "-dng-spp-mode",
+                    mode.as_str(),
+                    "-dng-highlight-mapping",
+                    "shoulder",
+                    "in.X3F",
+                ],
+            ] {
+                assert!(validate_args(&parse(&flags)).is_err());
+            }
         }
     }
 

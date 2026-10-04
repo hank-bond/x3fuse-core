@@ -34,7 +34,7 @@ mod ljpeg;
 pub(crate) mod metadata;
 mod opcodes;
 mod profiles;
-mod spp_standard;
+mod spp;
 mod strip;
 pub(crate) mod tags;
 pub(crate) mod tiff_writer;
@@ -93,12 +93,12 @@ pub(crate) fn write_controlled(
         check_mask_destination(path, mask)?;
     }
 
-    if opts.dng_spp_standard
+    if opts.dng_spp_mode.is_some()
         && (opts.dng_look.is_some()
             || opts.dng_highlight_mapping != crate::DngHighlightMapping::Linear)
     {
         return Err(Error::InvalidData(
-            "SPP Standard experiment requires linear mapping and no imported look".into(),
+            "SPP rendering requires linear mapping and no imported look".into(),
         ));
     }
     let look = opts
@@ -130,11 +130,10 @@ pub(crate) fn write_controlled(
     let calibration =
         ColorCalibration::new(reader, &wb).ok_or(Error::Library(crate::LibraryError::Argument))?;
 
-    let spp = if opts.dng_spp_standard {
-        Some(spp_standard::SppStandard::prepare(reader, &wb, control)?)
-    } else {
-        None
-    };
+    let spp = opts
+        .dng_spp_mode
+        .map(|mode| spp::SppLook::prepare(reader, &wb, mode, control))
+        .transpose()?;
     let mut image = reader.get_image_with_control(&opts, control)?;
     on_write();
     control.check()?;

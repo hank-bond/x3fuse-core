@@ -1,12 +1,17 @@
-//! Embed a CAMF-derived Standard look without changing linear camera samples.
+//! Embed a CAMF-derived color mode without changing linear camera samples.
+//!
+//! DP1, DP2 and DP3 Merrill share this rendering recipe. Each file supplies its
+//! camera matrix and gains for the selected white balance. Its source color-space
+//! property selects native sRGB or Adobe RGB routing, not the renderer's output.
 //!
 //! The camera adapter maps Adobe's rendering coordinates into the native tone
 //! and ColorDQ input range. A separate profile curve carries neutral brightness.
-//! Spatial processing stays upstream. This recipe does not reproduce the full
-//! Sigma Photo Pro pipeline.
+//! Spatial processing, including white-balance color shading, stays upstream.
+//! This recipe does not reproduce the full Sigma Photo Pro pipeline.
 
 mod color_dq;
 mod look;
+mod mode;
 mod tone;
 
 use x3f_sys::{self as sys, Control};
@@ -17,20 +22,16 @@ use super::{
     profiles, tags,
     tiff_writer::{DirectoryWriter, Value},
 };
-use crate::{Error, Reader};
+use crate::{Error, Reader, SppMode};
 use color_dq::ColorDq;
-use tone::{curve_at, exposure_tone, native_tone, profile_curve, SATURATION};
+use mode::ModeParameters;
+use tone::{curve_at, exposure_tone, profile_curve, SATURATION};
 
 // Rendering setup
 
 // The supported native setup branch adds one stop before ColorDQ and tone.
 // This gain belongs in rendering metadata, not in the stored camera samples.
 const SETUP_GAIN: f64 = 2.0;
-
-// CAMF stores eight color-mode rows with seven values per row. Standard uses
-// the first row. Keep the stored dimensions when reading the complete matrix.
-const TONE_MODE_COUNT: usize = 8;
-const TONE_PARAMETERS_PER_MODE: usize = 7;
 
 // Match the writer's rounding for ForwardMatrix and BaselineExposure. Baking
 // against unrounded calibration produces a different look in the Adobe SDK.
@@ -60,6 +61,20 @@ const ADOBE_TO_ROMM: [f64; 9] = [
     3697.0 / MATRIX_SCALE,
 ];
 
+// Native source 2 selects sRGB. Select this matrix for an sRGB camera property,
+// independently of the DNG renderer's output color space.
+const SRGB_TO_ROMM: [f64; 9] = [
+    2168.0 / MATRIX_SCALE,
+    1352.0 / MATRIX_SCALE,
+    576.0 / MATRIX_SCALE,
+    403.0 / MATRIX_SCALE,
+    3578.0 / MATRIX_SCALE,
+    115.0 / MATRIX_SCALE,
+    69.0 / MATRIX_SCALE,
+    482.0 / MATRIX_SCALE,
+    3546.0 / MATRIX_SCALE,
+];
+
 // Standard sRGB transfer constants serve two different boundaries: native
 // tone decoding and DNG look-table value encoding. They do not reinterpret
 // the camera samples as sRGB.
@@ -70,8 +85,10 @@ const SRGB_OFFSET: f64 = 0.055;
 const SRGB_SCALE: f64 = 1.055;
 const SRGB_POWER: f64 = 2.4;
 
-pub(super) struct SppStandard {
+pub(super) struct SppLook {
+    mode: SppMode,
     camera: [f64; 9],
+    output_matrix: [f64; 9],
     gain: [f64; 3],
     black: [f64; 3],
     iso: f64,
@@ -79,19 +96,37 @@ pub(super) struct SppStandard {
     dq: ColorDq,
 }
 
-impl SppStandard {
+impl SppLook {
     /// Capture calibration before processing changes the decoded sensor raster.
-    /// Require DP2 Merrill data and the Daylight or Sunlight white-balance preset.
-    pub(super) fn prepare(reader: &Reader, wb: &str, control: Control<'_>) -> Result<Self, Error> {
+    /// Resolve Auto, Daylight or Sunlight calibration from the file's CAMF lists.
+    /// Auto selects stored calibration rather than estimating a new white balance.
+    pub(super) fn prepare(
+        reader: &Reader,
+        wb: &str,
+        mode: SppMode,
+        control: Control<'_>,
+    ) -> Result<Self, Error> {
         control.check()?;
-        if reader.dng_prop("CAMMODEL").as_deref() != Some("SIGMA DP2 Merrill")
-            || !matches!(wb, "Daylight" | "Sunlight")
+        if !matches!(
+            reader.dng_prop("CAMMODEL").as_deref(),
+            Some("SIGMA DP1 Merrill" | "SIGMA DP2 Merrill" | "SIGMA DP3 Merrill")
+        ) || !matches!(wb, "Auto" | "Daylight" | "Sunlight")
         {
-            return Err(invalid("only DP2 Merrill Daylight/Sunlight is verified"));
+            return Err(invalid(
+                "requires DP Merrill Auto, Daylight or Sunlight calibration",
+            ));
         }
-        let camera = reader
-            .dng_camf_matrix_3x3("SunlightCCMatrix")
-            .ok_or_else(|| invalid("missing Sunlight matrix"))?;
+        let mut camera = reader
+            .dng_camf_wb_matrix_3x3("WhiteBalanceColorCorrections", wb)
+            .ok_or_else(|| invalid("missing selected white-balance matrix"))?;
+        let parameters = ModeParameters::read(reader, mode)?;
+        if mode != SppMode::Standard {
+            // Native stage 2 right-multiplies the camera matrix by the mode matrix
+            // before ColorDQ. This metadata path preserves that pointwise order
+            // but does not move the mode inside upstream denoising or recovery.
+            camera = mat3_mul(&camera, &parameters.matrix);
+        }
+        let output_matrix = source_to_romm(reader.dng_prop("COLORSPACE").as_deref())?;
         let gain = reader
             .dng_gain(Some(wb))
             .ok_or_else(|| invalid("missing gain"))?;
@@ -106,7 +141,6 @@ impl SppStandard {
         let mut black = [0.0; 3];
         let mut deviation = [0.0; 3];
         let mut maximum = [0; 3];
-        let mut settings = [0.0; TONE_MODE_COUNT * TONE_PARAMETERS_PER_MODE];
         let mut amplitudes = [0.0; 3];
         // SAFETY: all reads use the caller's loaded reader, with bounded output arrays.
         let valid = unsafe {
@@ -129,15 +163,6 @@ impl SppStandard {
                     sys::matrix_type_t_M_FLOAT,
                     amplitudes.as_mut_ptr().cast(),
                 ) != 0
-                && sys::x3f_get_camf_matrix(
-                    reader.x3f.as_ptr(),
-                    c"TCColorModeSettings".as_ptr() as *mut _,
-                    TONE_MODE_COUNT as i32,
-                    TONE_PARAMETERS_PER_MODE as i32,
-                    0,
-                    sys::matrix_type_t_M_FLOAT,
-                    settings.as_mut_ptr().cast(),
-                ) != 0
         };
         if !valid || maximum != [SATURATION as u32; 3] {
             return Err(invalid("missing calibration or unverified raw scale"));
@@ -146,7 +171,6 @@ impl SppStandard {
             .iter()
             .chain(&gain)
             .chain(&black)
-            .chain(&settings)
             .any(|v| !v.is_finite())
             || gain.iter().any(|v| *v <= 0.0)
             || black.iter().any(|v| !(0.0..SATURATION as f64).contains(v))
@@ -155,30 +179,16 @@ impl SppStandard {
         {
             return Err(invalid("invalid calibration"));
         }
-        let [scale, start, end, steep1, _gamma, breakpoint, steep2]: [f64;
-            TONE_PARAMETERS_PER_MODE] = std::array::from_fn(|i| settings[i]);
-        // The normal Standard branch uses five shape values from its CAMF row.
-        // It does not use the stored gamma or a multi-axis color-mode table.
-        if scale != 1.0
-            || start >= end
-            || steep1 <= 0.0
-            || steep2 <= 0.0
-            || breakpoint <= 0.0
-            || breakpoint >= 1.0
-            || reader
-                .dng_camf_multi_axis_table("MultiAxisTable_Standard")
-                .is_some()
-        {
-            return Err(invalid("unverified tone parameters"));
-        }
-        let tone = native_tone([start, end, steep1, breakpoint, steep2]);
+        let tone = parameters.tone;
         // Native ColorDQ uses float ISO division. The additional setup gain
         // changes its input coordinates, not its correction amplitude.
         let dq_iso = (capture as f32 / sensor as f32).min(color_dq::MAX_ISO_GAIN) as f64;
         let dq = ColorDq::new(amplitudes.map(|v| v * dq_iso))?;
         control.check()?;
         Ok(Self {
+            mode,
             camera,
+            output_matrix,
             gain,
             black,
             iso,
@@ -249,12 +259,15 @@ impl SppStandard {
             .collect();
         let table = look::bake(
             &adapter,
-            &ADOBE_TO_ROMM,
+            &self.output_matrix,
             &self.tone,
             &effective_tone,
             &self.dq,
             control,
         )?;
+        let name = std::ffi::CString::new(self.mode.as_str()).expect("mode names contain no NUL");
+        ifd.add(tags::PROFILE_NAME, Value::Ascii(name.clone()));
+        ifd.add(tags::AS_SHOT_PROFILE_NAME, Value::Ascii(name));
         ifd.add(
             tags::PROFILE_LOOK_TABLE_DIMS,
             Value::Long(look::DIMS.to_vec()),
@@ -273,8 +286,16 @@ impl SppStandard {
     }
 }
 
+fn source_to_romm(space: Option<&str>) -> Result<[f64; 9], Error> {
+    match space {
+        Some("sRGB") => Ok(SRGB_TO_ROMM),
+        Some("AdobeRGB") => Ok(ADOBE_TO_ROMM),
+        _ => Err(invalid("missing or unsupported source color space")),
+    }
+}
+
 fn invalid(message: &str) -> Error {
-    Error::InvalidData(format!("SPP Standard experiment: {message}"))
+    Error::InvalidData(format!("SPP rendering: {message}"))
 }
 
 fn normalize_white(m: [f64; 9]) -> [f64; 9] {
@@ -307,6 +328,16 @@ fn srgb_encode(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_color_property_selects_native_routing() {
+        assert_eq!(source_to_romm(Some("sRGB")).unwrap(), SRGB_TO_ROMM);
+        assert_eq!(source_to_romm(Some("AdobeRGB")).unwrap(), ADOBE_TO_ROMM);
+        assert_ne!(SRGB_TO_ROMM, ADOBE_TO_ROMM);
+        for space in [None, Some(""), Some("ProPhoto"), Some("unknown")] {
+            assert!(source_to_romm(space).is_err());
+        }
+    }
 
     #[test]
     fn normalized_romm_matches_adobe_white() {

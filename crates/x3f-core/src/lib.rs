@@ -48,6 +48,9 @@ mod icc;
 mod image;
 pub mod output;
 mod scene;
+mod spp_mode;
+
+pub use spp_mode::SppMode;
 
 pub use conversion::{convert_file, ConversionReport, ConversionStage, OutputFormat};
 pub use globals::{
@@ -150,12 +153,14 @@ pub struct ProcessOptions {
     /// default DNG profile, regardless of camera model. Leaves calibration,
     /// raw samples, and the thumbnail unchanged. Defaults to `None`.
     pub dng_look: Option<std::path::PathBuf>,
-    /// Generate Standard look and tone metadata for DP2 Merrill DNG output.
-    /// Require Daylight or Sunlight and linear highlight mapping. Leave camera
-    /// samples, calibration, exposure metadata, and generated previews unchanged.
-    /// Defaults to `false`. Cannot be combined with an imported DCP look.
+    /// Optional CAMF-derived color mode for DP1, DP2 and DP3 Merrill DNG output.
+    /// Use the file's Auto, Daylight or Sunlight calibration and require linear
+    /// highlight mapping. The source color-space property selects native sRGB or
+    /// Adobe RGB routing. Auto uses stored calibration, not a new WB estimate.
+    /// Leave camera samples, calibration, exposure metadata and previews unchanged.
+    /// Defaults to `None`. Cannot be combined with an imported DCP look.
     /// Does not enable recovery or change denoising and bad-pixel repair options.
-    pub dng_spp_standard: bool,
+    pub dng_spp_mode: Option<SppMode>,
     /// Estimate missing highlight brightness and color when writing DNG.
     /// Defaults to `false`. Merrill uses gradient-based reconstruction.
     /// Older cameras and Quattro use separate reconstruction paths.
@@ -217,7 +222,7 @@ impl Default for ProcessOptions {
             denoise_intensity: 10,
             opcodes_dir: None,
             dng_look: None,
-            dng_spp_standard: false,
+            dng_spp_mode: None,
             dng_highlight_recovery: false,
             dng_recovery_mask: None,
             dng_highlight_mapping: DngHighlightMapping::default(),

@@ -49,7 +49,7 @@ pub(super) fn bake(
     let mut table = Vec::with_capacity((nh * ns * nv * 3) as usize);
     for v in 0..nv {
         control.check()?;
-        let ve = v as f64 / (nv - 1) as f64;
+        let encoded_value = v as f64 / (nv - 1) as f64;
         for h in 0..nh {
             let hue = h as f64 / nh as f64;
             for s in 0..ns {
@@ -58,7 +58,7 @@ pub(super) fn bake(
                     table.extend([0.0, 1.0, 1.0]);
                     continue;
                 }
-                let rgb = hsv_to_rgb(hue, sat, srgb_decode(ve));
+                let rgb = hsv_to_rgb(hue, sat, srgb_decode(encoded_value));
                 let counts = dq.apply(mul(adapter, rgb).map(|x| x * SATURATION as f64));
                 let target = mul(
                     output,
@@ -66,14 +66,14 @@ pub(super) fn bake(
                 )
                 .map(|x| x.clamp(0.0, 1.0));
                 let target = inverse_rgb_tone(target, effective_tone);
-                let [th, ts, tv] = rgb_to_hsv(target);
-                let shift = if s == 0 || ts < HUE_SATURATION_EPSILON {
+                let [target_hue, target_saturation, target_value] = rgb_to_hsv(target);
+                let shift = if target_saturation < HUE_SATURATION_EPSILON {
                     0.0
                 } else {
-                    ((th - hue + 0.5).rem_euclid(1.0) - 0.5) * DEGREES_PER_TURN
+                    ((target_hue - hue + 0.5).rem_euclid(1.0) - 0.5) * DEGREES_PER_TURN
                 };
-                let saturation = if s == 0 { 1.0 } else { ts / sat };
-                let value = srgb_encode(tv) / ve;
+                let saturation = target_saturation / sat;
+                let value = srgb_encode(target_value) / encoded_value;
                 if !shift.is_finite() || !saturation.is_finite() || !value.is_finite() {
                     return Err(invalid("invalid generated look table"));
                 }
@@ -110,7 +110,7 @@ fn rgb_to_hsv(rgb: [f64; 3]) -> [f64; 3] {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tone::native_tone;
+    use super::super::tone::{native_tone, ToneShape};
     use super::*;
 
     const IDENTITY: [f64; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
@@ -130,13 +130,13 @@ mod tests {
 
     #[test]
     fn color_residual_obeys_adobe_constraints() {
-        let tone = native_tone([
-            -1.17_f32 as f64,
-            1.65_f32 as f64,
-            3.0,
-            0.1_f32 as f64,
-            1.7_f32 as f64,
-        ]);
+        let tone = native_tone(ToneShape {
+            start: -1.17_f32 as f64,
+            end: 1.65_f32 as f64,
+            lower_steepness: 3.0,
+            breakpoint: 0.1_f32 as f64,
+            upper_steepness: 1.7_f32 as f64,
+        });
         let dq = ColorDq::new([8.0; 3]).unwrap();
         let table = bake(&IDENTITY, &IDENTITY, &tone, &tone, &dq, Control::none()).unwrap();
         assert!(table

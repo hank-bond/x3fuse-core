@@ -56,9 +56,9 @@ pub fn convert_file(
 ) -> Result<ConversionReport, Error> {
     let control = Control::new(cancel);
     control.check()?;
-    if options.dng_spp_standard && format != OutputFormat::Dng {
+    if options.dng_spp_mode.is_some() && format != OutputFormat::Dng {
         return Err(Error::InvalidData(
-            "SPP Standard experiment requires DNG output".into(),
+            "SPP rendering requires DNG output".into(),
         ));
     }
     if options.dng_look.is_some() && format != OutputFormat::Dng {
