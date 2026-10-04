@@ -5,8 +5,11 @@
 //! balanced pair does not establish white. The missing third-layer relationship
 //! can also belong to a colored surface. The graph has no fixed donor radius or
 //! scene classes.
-//! Cells crossing a reliable native-layer edge are refined at pixel spacing;
-//! color cannot propagate across that edge. Ordinary cells stay on the coarse grid.
+//! Cells crossing a noise-aware native-layer/ratio edge are refined at pixel
+//! spacing; the native solver uses localized cuts inside that guide footprint.
+//! Other cells stay on the coarse grid, where excluding mixed cells can leave
+//! donorless components. The native share depends on scene texture and clipping.
+//! The edge guide is built once before either encoding pass.
 //!
 //! # Reading order
 //!
@@ -21,6 +24,8 @@
 use super::{tone_anchor, DngCtx, LocalRecovery};
 use crate::{Control, Error::InvalidData};
 use std::{cmp::Ordering, collections::BinaryHeap};
+#[path = "color_edges.rs"]
+mod color_edges;
 
 // Color behavior settings
 // These settings balance measured color, surrounding color, and a neutral
@@ -116,11 +121,6 @@ const PAIR_ERROR_ALLOWANCE: f64 = PAIR_AGREEMENT_SCALE;
 // finer spatial sampling and create more cells for the solver to process.
 const GRID_STEP_PIXELS: usize = 8;
 
-// A 20% step in a usable native layer is a boundary for color borrowing.
-// Test before cell averaging: narrow stripes can share the same cell mean.
-// ponytail: fixed relative threshold; calibrate for sensor noise when stripe RAWs are available.
-const NATIVE_EDGE_RATIO: f64 = 1.2;
-
 // Minimum number of usable, intact pixels needed for a cell to supply boundary
 // color. Keep this positive, and review it when changing cell size because the
 // number of available measurements changes with the area of each cell.
@@ -204,14 +204,18 @@ impl Field {
         let mut nodes = vec![Node::default(); rows * cols];
         let mut native_colors = Vec::new();
         let mut mixed_cells = vec![false; rows * cols];
-        let mut above = vec![None; ctx.cols as usize];
         let neutral = unsafe { *(ctx.prior as *const [f64; 3]) };
         let y = ctx
             .camera_y
             .ok_or(InvalidData("color field requires Merrill Y"))?;
+        let edges = color_edges::Edges::build(
+            ctx.rows as usize,
+            ctx.cols as usize,
+            |row, col| unsafe { LayerSample::read(ctx, model, data, stride, row, col) },
+            control,
+        )?;
         for r in 0..rows {
             control.check()?;
-            let mut left = [None; GRID_STEP_PIXELS];
             for c in 0..cols {
                 let n = &mut nodes[r * cols + c];
                 let mut count = 0.0;
@@ -219,58 +223,32 @@ impl Field {
                 let mut donors = 0.0;
                 let mut stressed = false;
                 let mut mixed = false;
-                let mut previous_row = [None; GRID_STEP_PIXELS];
                 for row in r * GRID_STEP_PIXELS..((r + 1) * GRID_STEP_PIXELS).min(ctx.rows as usize)
                 {
-                    let mut previous = None;
                     for col in
                         c * GRID_STEP_PIXELS..((c + 1) * GRID_STEP_PIXELS).min(ctx.cols as usize)
                     {
-                        let measured = unsafe { ctx.measured(data, stride, row, col) };
-                        let mask = model.mask(row, col);
-                        let repaired = model.repaired_site(row, col);
-                        let sample = LayerSample {
+                        let sample =
+                            unsafe { LayerSample::read(ctx, model, data, stride, row, col) };
+                        let LayerSample {
                             measured,
                             mask,
                             repaired,
-                        };
-                        let k = col % GRID_STEP_PIXELS;
-                        if k == 0
-                            && c > 0
-                            && left[row % GRID_STEP_PIXELS].is_some_and(|a| native_edge(a, sample))
-                        {
+                        } = sample;
+                        if col > 0 && edges.near_boundary((row, col - 1), (row, col)) {
                             mixed = true;
-                            mixed_cells[r * cols + c - 1] = true;
+                            if col % GRID_STEP_PIXELS == 0 {
+                                mixed_cells[r * cols + c - 1] = true;
+                            }
                         }
-                        if row % GRID_STEP_PIXELS == 0
-                            && r > 0
-                            && above[col].is_some_and(|a| native_edge(a, sample))
-                        {
+                        if row > 0 && edges.near_boundary((row - 1, col), (row, col)) {
                             mixed = true;
-                            mixed_cells[(r - 1) * cols + c] = true;
-                        }
-                        if col + 1 == ((c + 1) * GRID_STEP_PIXELS).min(ctx.cols as usize) {
-                            left[row % GRID_STEP_PIXELS] = Some(sample);
-                        }
-                        if row + 1 == ((r + 1) * GRID_STEP_PIXELS).min(ctx.rows as usize) {
-                            above[col] = Some(sample);
-                        }
-                        if !mixed {
-                            mixed = previous.is_some_and(|a| native_edge(a, sample))
-                                || previous_row[k].is_some_and(|a| native_edge(a, sample));
-                            previous = Some(sample);
-                            previous_row[k] = Some(sample);
+                            if row % GRID_STEP_PIXELS == 0 {
+                                mixed_cells[(r - 1) * cols + c] = true;
+                            }
                         }
                         n.affected |= mask != [FULL_RELIABILITY; 3];
-                        let mut tone = tone_anchor::recover_severe(measured, mask, neutral, y);
-                        if let Some(g) = ctx.gradient {
-                            g.apply(row, col, &mut tone, measured, neutral);
-                        }
-                        let target = if tone.available {
-                            tone.amplitude * dot3(y, neutral)
-                        } else {
-                            dot3(y, measured)
-                        };
+                        let target = sample.tone_target(ctx, row, col, neutral, y);
                         if target.is_finite() && target > MIN_CELL_LUMINANCE {
                             n.guide.tone += target.ln();
                             tones += 1.0;
@@ -343,7 +321,7 @@ impl Field {
         };
         result.reconstruct(control)?;
         unsafe {
-            result.refine_native(ctx, model, data, stride, control)?;
+            result.refine_native(ctx, model, data, stride, &edges, control)?;
         }
         Ok(result)
     }
@@ -457,6 +435,7 @@ impl Field {
         model: &LocalRecovery,
         data: &[u16],
         stride: usize,
+        edges: &color_edges::Edges,
         control: Control<'_>,
     ) -> crate::Result<()> {
         if self.native_colors.is_empty() {
@@ -467,25 +446,16 @@ impl Field {
             .camera_y
             .ok_or(InvalidData("native color requires Merrill Y"))?;
         let source = |row, col| {
-            let measured = unsafe { ctx.measured(data, stride, row, col) };
-            let mask = model.mask(row, col);
-            let repaired = model.repaired_site(row, col);
-            let mut tone = tone_anchor::recover_severe(measured, mask, neutral, y);
-            if let Some(g) = ctx.gradient {
-                g.apply(row, col, &mut tone, measured, neutral);
-            }
-            let target = if tone.available {
-                tone.amplitude * dot3(y, neutral)
-            } else {
-                dot3(y, measured)
-            };
+            let layers = unsafe { LayerSample::read(ctx, model, data, stride, row, col) };
+            let LayerSample {
+                measured,
+                mask,
+                repaired,
+            } = layers;
+            let target = layers.tone_target(ctx, row, col, neutral, y);
             let (pair, q) = evidence(measured, mask, repaired);
             NativeSource {
-                layers: LayerSample {
-                    measured,
-                    mask,
-                    repaired,
-                },
+                layers,
                 guide: Guide {
                     pair,
                     q,
@@ -550,12 +520,12 @@ impl Field {
                     continue;
                 }
                 let (r, c) = (r as usize, c as usize);
+                if edges.blocked((row, col), (r, c)) {
+                    continue;
+                }
                 let offset = self.native_offset(r, c);
                 let j = offset.map_or(NONE, |n| index[n]);
                 let b = if j == NONE { source(r, c) } else { sources[j] };
-                if native_edge(a.layers, b.layers) {
-                    continue;
-                }
                 let w = affinity(a.guide, b.guide);
                 if w == 0.0 {
                     continue;
@@ -815,19 +785,40 @@ struct LayerSample {
     repaired: bool,
 }
 
-fn native_edge(a: LayerSample, b: LayerSample) -> bool {
-    if a.repaired || b.repaired {
-        return false;
+impl LayerSample {
+    unsafe fn read(
+        ctx: &DngCtx<'_>,
+        model: &LocalRecovery,
+        data: &[u16],
+        stride: usize,
+        row: usize,
+        col: usize,
+    ) -> Self {
+        Self {
+            measured: unsafe { ctx.measured(data, stride, row, col) },
+            mask: model.mask(row, col),
+            repaired: model.repaired_site(row, col),
+        }
     }
-    (0..3).any(|c| {
-        let (x, y) = (a.measured[c], b.measured[c]);
-        a.mask[c] == FULL_RELIABILITY
-            && b.mask[c] == FULL_RELIABILITY
-            && x.is_finite()
-            && y.is_finite()
-            && x.min(y) > MIN_DONOR_SIGNAL
-            && x.max(y) > NATIVE_EDGE_RATIO * x.min(y)
-    })
+
+    fn tone_target(
+        self,
+        ctx: &DngCtx<'_>,
+        row: usize,
+        col: usize,
+        neutral: [f64; 3],
+        y: [f64; 3],
+    ) -> f64 {
+        let mut tone = tone_anchor::recover_severe(self.measured, self.mask, neutral, y);
+        if let Some(g) = ctx.gradient {
+            g.apply(row, col, &mut tone, self.measured, neutral);
+        }
+        if tone.available {
+            tone.amplitude * dot3(y, neutral)
+        } else {
+            dot3(y, self.measured)
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -855,19 +846,21 @@ fn smooth(x: f64) -> f64 {
     x * x * (3.0 - 2.0 * x)
 }
 fn evidence(m: [f64; 3], mask: [u8; 3], repaired: bool) -> ([f64; 3], [f64; 3]) {
-    let q: [f64; 3] = std::array::from_fn(|c| {
-        if repaired || !m[c].is_finite() {
-            0.0
-        } else {
-            (mask[c] as f64 / FULL_RELIABILITY as f64).powi(RELIABILITY_POWER)
-                * smooth((m[c] - SIGNAL_TRUST_START) / SIGNAL_TRUST_WIDTH)
-        }
-    });
+    let q: [f64; 3] = std::array::from_fn(|c| layer_trust(m[c], mask[c], repaired));
     let l = m.map(|v| v.max(MIN_LOG_INPUT).ln());
     (
         [l[0] - l[1], l[0] - l[2], l[1] - l[2]],
         [q[0] * q[1], q[0] * q[2], q[1] * q[2]],
     )
+}
+// The guide and color fit use the same reliability and dark-signal policy.
+fn layer_trust(value: f64, reliability: u8, repaired: bool) -> f64 {
+    if repaired || !value.is_finite() {
+        0.0
+    } else {
+        (reliability as f64 / FULL_RELIABILITY as f64).powi(RELIABILITY_POWER)
+            * smooth((value - SIGNAL_TRUST_START) / SIGNAL_TRUST_WIDTH)
+    }
 }
 #[derive(Clone, Copy, Default)]
 struct Guide {
@@ -1122,14 +1115,22 @@ fn solve(
                 .zip(ax.iter().flatten())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0_f64, f64::max);
-            if !norm(&ax).is_finite()
-                || !actual.is_finite()
-                || actual > tolerance
-                || !norm(x).is_finite()
-            {
+            if !norm(&ax).is_finite() || !actual.is_finite() || !norm(x).is_finite() {
                 return Err(InvalidData("color field true residual failed"));
             }
-            return Ok(());
+            if actual <= tolerance {
+                return Ok(());
+            }
+            // Roundoff can make the recursive residual optimistic in a large
+            // or ill-conditioned component. Restart from the measured residual
+            // instead of rejecting a still-solvable system or relaxing the
+            // acceptance tolerance. Restarts share the same iteration budget.
+            for i in 0..x.len() {
+                residual[i] = [rhs[i][0] - ax[i][0], rhs[i][1] - ax[i][1]];
+                z[i] = inverse(rows[i].block, residual[i]);
+                direction[i] = z[i];
+            }
+            rz = dot(&residual, &z);
         }
         if iteration == MAX_SOLVER_ITERATIONS {
             return Err(InvalidData("color field did not converge"));
@@ -1238,34 +1239,6 @@ mod tests {
     const M: [f64; 9] = [
         4.45774, -1.90728, 0.581922, -4.22818, 4.30012, -0.701463, 3.1376, -5.81127, 3.31683,
     ];
-    #[test]
-    fn native_edges_require_reliable_signal_in_the_same_layer() {
-        let a = LayerSample {
-            measured: [0.25, 0.5, 1.0],
-            mask: [255, 255, 0],
-            repaired: false,
-        };
-        let mut b = a;
-        b.measured[0] *= 1.25;
-        assert!(native_edge(a, b) && native_edge(b, a));
-        b.mask[0] = 254;
-        assert!(!native_edge(a, b));
-        b.mask = a.mask;
-        b.repaired = true;
-        assert!(!native_edge(a, b));
-        b = a;
-        b.measured[2] = 2.0; // A clipped layer supplies no boundary evidence.
-        assert!(!native_edge(a, b));
-        b = a;
-        b.measured = a.measured.map(|v| v * 1.02); // Smooth exposure ramp.
-        assert!(!native_edge(a, b));
-        let dark = LayerSample {
-            measured: [0.001; 3],
-            mask: [255; 3],
-            repaired: false,
-        };
-        assert!(!native_edge(dark, a));
-    }
     fn line(length: usize) -> Field {
         let prior = ColorPrior::new(P, M).unwrap();
         let g = Guide {
@@ -1570,6 +1543,60 @@ mod tests {
             assert!((a - b).abs() < 1e-9);
         }
     }
+    #[test]
+    fn color_solver_restarts_without_relaxing_the_true_residual_limit() {
+        // A positive definite, anisotropic color metric and weak neutral anchor
+        // reproduce recursive-residual drift on a small grid. The old solver
+        // rejected this solvable system at its final true-residual check.
+        let width = 8;
+        let metric = [100001.0, 100002.0, 100000.0];
+        let mut rows = Vec::new();
+        for i in 0..width * width {
+            let (r, c) = (i / width, i % width);
+            let mut e = Equation {
+                block: metric.map(|v| v * 1e-6),
+                neighbors: [NONE; 4],
+                weights: [0.0; 4],
+            };
+            for (k, j) in [
+                (r > 0).then(|| i - width),
+                (r + 1 < width).then_some(i + width),
+                (c > 0).then(|| i - 1),
+                (c + 1 < width).then_some(i + 1),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if let Some(j) = j {
+                    let w = 0.5 + ((i + j) % 17) as f64 / 34.0;
+                    e.neighbors[k] = j;
+                    e.weights[k] = w;
+                    for (block, m) in e.block.iter_mut().zip(metric) {
+                        *block += w * m;
+                    }
+                }
+            }
+            let data = 0.06 * (i % 7) as f64 / 7.0;
+            e.block[0] += data;
+            e.block[1] += data;
+            e.block[2] -= data;
+            rows.push(e);
+        }
+        let truth = vec![[-1.26, -0.5]; rows.len()];
+        let mut rhs = vec![[0.0; 2]; rows.len()];
+        product(&rows, metric, &truth, &mut rhs);
+        let mut x = vec![[0.0; 2]; rows.len()];
+        solve(&rows, metric, &rhs, &mut x, Control::none()).unwrap();
+        let mut actual = vec![[0.0; 2]; rows.len()];
+        product(&rows, metric, &x, &mut actual);
+        let error: Vec<_> = actual
+            .iter()
+            .zip(&rhs)
+            .map(|(a, b)| [a[0] - b[0], a[1] - b[1]])
+            .collect();
+        assert!(norm(&error) <= SOLVER_TOLERANCE * norm(&rhs).max(1.0));
+    }
+
     #[test]
     fn neutral_boundary_and_ratio_use_consistent_missing_layer_direction() {
         let mut f = line(25);

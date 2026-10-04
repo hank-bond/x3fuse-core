@@ -162,19 +162,55 @@ a much darker surface is not sufficient evidence for borrowing its color.
 Unaffected low-signal cells cannot connect unrelated donors. These checks limit
 color transfer, but they do not identify surfaces or materials.
 
-Before averaging cells, the stage checks adjacent native pixels for a signal
-step greater than 20% in a layer that is fully reliable on both sides. Dark
-measurements and repaired pixels cannot establish an edge. Cells touching these
-edges do not donate their mixed color or connect the coarse field. Affected
-edge cells instead use the same color equations at native resolution, with no
-neighbor contribution across detected edges. This lets thin stripes borrow
-color along their length without averaging with a neighboring white stripe.
-Ordinary cells retain the coarse calculation.
+Before averaging cells, the stage builds a noise-aware boundary guide from
+native log-layer measurements and their pairwise differences. A normalized
+Gaussian with sigma 0.85 pixels smooths that guide using reliability weights.
+Partly clipped and dark layers have reduced influence; repaired samples supply
+none. The guide and color equations share fourth-power reliability weighting and
+a cubic dark-signal taper from 0.002 to 0.02. The source pixels and the brightness reconstruction are not blurred.
 
-This is a relative signal threshold, not material recognition. A sharp lighting
-change can also stop color borrowing, while a weak edge or one hidden by clipping
-may remain undetected. A stripe still needs surviving color evidence; a boundary
-alone cannot determine its missing hue.
+Strong boundaries exceed three estimated noise scales, with minimum log steps
+of 0.035 for layers and 0.025 for ratios. Weak boundaries at 60% of that threshold
+survive only when connected to a strong boundary by four-neighbor hysteresis.
+The noise estimate is the median absolute smoothing residual on bright,
+reliable samples, scaled by 0.35/0.6745. This scale is an empirical guide from
+the exp-10 trials; scene texture can raise it, and it is not sensor calibration.
+
+A native step above 20% in any fully reliable layer above 0.02 signal supplies an
+additional strong boundary. This preserves fine stripes that smoothing erases
+and that the residual-based noise estimate mistakes for noise. Where two such
+native transitions lie inside the seven-pixel kernel footprint along an axis,
+their smoothed guides can overlap. In that narrow region, a smoothed cut also
+needs a native feature step exceeding the strong threshold. Native strong cuts
+always remain. This localizes the barrier without cutting a diagonal stripe's
+interior off from its donors. Boundaries elsewhere retain the smoothed guide.
+
+Cells touching the wider guide footprint do not donate their mixed color or
+connect the coarse field. Affected edge cells use the existing color equations
+at native resolution, with no neighbor contribution across a localized boundary.
+Other cells retain the coarse calculation. The share of native work depends on
+scene texture and clipping; it can dominate on detailed scenes. Keeping the
+wider refinement footprint avoids reintroducing mixed coarse averages while
+localizing a fine boundary.
+
+Removing mixed cells can leave a smooth coarse component without donors even
+when a path through native pixels exists. Such a component uses its surviving
+ratios and the neutral prior. Extending native refinement to those components
+was tested on the three review images: it recovered color in a controlled
+synthetic case but increased visible stripe spill and processing time. It is
+not enabled. More donor connectivity is not, by itself, evidence of better
+recovery.
+
+These boundaries do not identify materials. Lighting changes can also stop color
+borrowing; weak or fully clipped boundaries can remain undetected. A stripe still
+needs surviving color evidence because a boundary alone cannot determine its
+missing hue. This variant does not add the experimental confidence-based color
+fade or directional/segmented donor selection.
+
+The edge builder processes one feature at a time, stores threshold membership in
+one byte per pixel, and uses scanline buffers for its separable Gaussian passes.
+These storage choices do not change the convolution. The native-resolution
+refinement can still require substantial memory for large clipped regions.
 
 A *neutral prior* adds a soft constraint toward the neutral layer ratios from the
 camera calibration. The constraint is strongest where pair evidence is absent,
@@ -224,6 +260,8 @@ recovery is enabled. The override does not enable recovery on its own.
 
 Headroom measurement and encoding read the same immutable color field. The solver
 checks cancellation and recomputes the equation error before accepting its result.
+If roundoff makes the accumulated color-solver residual optimistic, it restarts
+from the recomputed residual within the original iteration budget and tolerance.
 Invalid calibration or failure to converge stops conversion rather than selecting
 another donor algorithm.
 
@@ -266,6 +304,7 @@ The following files are under `crates/x3f-sys/src/`:
 | `tone_anchor.rs` | Estimate each affected pixel's starting brightness. |
 | `gradient_tone.rs` | Solve for brightness using neighboring layer differences. |
 | `color_field.rs` | Reconstruct highlight color from intact boundaries, surviving ratios, and a calibrated-neutral prior. |
+| `color_edges.rs` | Build noise-aware boundaries used by coarse-cell selection and the native color solver. |
 | `highlight_color.rs` | Apply those ratios at the chosen brightness. |
 | `recovery_mask.rs` | Write the optional source-reliability mask. |
 
