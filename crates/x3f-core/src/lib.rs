@@ -41,6 +41,7 @@ use x3f_sys as sys;
 // we touch here (FILE / fopen / fclose / free).
 use x3f_sys::sysabi as libc;
 
+mod color_mode;
 mod conversion;
 pub mod dcp;
 mod globals;
@@ -48,6 +49,8 @@ mod icc;
 mod image;
 pub mod output;
 mod scene;
+
+pub use color_mode::ColorMode;
 
 pub use conversion::{convert_file, ConversionReport, ConversionStage, OutputFormat};
 pub use globals::{
@@ -150,6 +153,19 @@ pub struct ProcessOptions {
     /// default DNG profile, regardless of camera model. Leaves calibration,
     /// raw samples, and the thumbnail unchanged. Defaults to `None`.
     pub dng_look: Option<std::path::PathBuf>,
+    /// Embed a camera profile for the selected DP1, DP2 or DP3 Merrill color mode.
+    /// Build it from CAMF, the camera metadata stored in the X3F. Any white-balance
+    /// preset with valid calibration in the file can be used. Auto uses the saved
+    /// calibration rather than estimating white balance again.
+    ///
+    /// The file's sRGB or Adobe RGB setting chooses the profile's internal color
+    /// conversion, not the reader's output space. Raw samples, camera calibration,
+    /// exposure metadata and previews stay unchanged with the same processing options.
+    ///
+    /// Defaults to `None`, leaving conversion unchanged. Requires linear highlight
+    /// mapping and cannot be combined with `dng_look`. Selecting a mode does not
+    /// enable recovery or change the denoising and bad-pixel repair settings.
+    pub dng_color_mode: Option<ColorMode>,
     /// Estimate missing highlight brightness and color when writing DNG.
     /// Defaults to `false`. Merrill uses gradient-based reconstruction.
     /// Older cameras and Quattro use separate reconstruction paths.
@@ -211,6 +227,7 @@ impl Default for ProcessOptions {
             denoise_intensity: 10,
             opcodes_dir: None,
             dng_look: None,
+            dng_color_mode: None,
             dng_highlight_recovery: false,
             dng_recovery_mask: None,
             dng_highlight_mapping: DngHighlightMapping::default(),
