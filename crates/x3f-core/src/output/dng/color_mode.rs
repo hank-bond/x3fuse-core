@@ -22,7 +22,7 @@ use super::{
     profiles, tags,
     tiff_writer::{DirectoryWriter, Value},
 };
-use crate::{Error, Reader, SppMode};
+use crate::{ColorMode, Error, Reader};
 use color_dq::ColorDq;
 use mode::ModeParameters;
 use tone::{curve_at, exposure_tone, profile_curve, SATURATION};
@@ -85,8 +85,8 @@ const SRGB_OFFSET: f64 = 0.055;
 const SRGB_SCALE: f64 = 1.055;
 const SRGB_POWER: f64 = 2.4;
 
-pub(super) struct SppLook {
-    mode: SppMode,
+pub(super) struct CameraProfile {
+    mode: ColorMode,
     camera: [f64; 9],
     output_matrix: [f64; 9],
     gain: [f64; 3],
@@ -96,14 +96,14 @@ pub(super) struct SppLook {
     dq: ColorDq,
 }
 
-impl SppLook {
+impl CameraProfile {
     /// Capture calibration before processing changes the decoded sensor raster.
     /// Resolve Auto, Daylight or Sunlight calibration from the file's CAMF lists.
     /// Auto selects stored calibration rather than estimating a new white balance.
     pub(super) fn prepare(
         reader: &Reader,
         wb: &str,
-        mode: SppMode,
+        mode: ColorMode,
         control: Control<'_>,
     ) -> Result<Self, Error> {
         control.check()?;
@@ -120,7 +120,7 @@ impl SppLook {
             .dng_camf_wb_matrix_3x3("WhiteBalanceColorCorrections", wb)
             .ok_or_else(|| invalid("missing selected white-balance matrix"))?;
         let parameters = ModeParameters::read(reader, mode)?;
-        if mode != SppMode::Standard {
+        if mode != ColorMode::Standard {
             // Native stage 2 right-multiplies the camera matrix by the mode matrix
             // before ColorDQ. This metadata path preserves that pointwise order
             // but does not move the mode inside upstream denoising or recovery.
@@ -197,7 +197,7 @@ impl SppLook {
         })
     }
 
-    /// Add the look and tone tags using the DNG's published calibration and scale.
+    /// Embed the camera profile using the DNG's published calibration and scale.
     /// Leave raw samples, camera calibration, exposure tags, and previews unchanged.
     pub(super) fn embed(
         &self,
@@ -295,7 +295,7 @@ fn source_to_romm(space: Option<&str>) -> Result<[f64; 9], Error> {
 }
 
 fn invalid(message: &str) -> Error {
-    Error::InvalidData(format!("SPP rendering: {message}"))
+    Error::InvalidData(format!("Color-mode rendering: {message}"))
 }
 
 fn normalize_white(m: [f64; 9]) -> [f64; 9] {

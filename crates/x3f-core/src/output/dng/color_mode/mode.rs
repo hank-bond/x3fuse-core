@@ -4,7 +4,7 @@ use super::{
     invalid,
     tone::{native_tone, ToneShape},
 };
-use crate::{Error, Reader, SppMode};
+use crate::{ColorMode, Error, Reader};
 use x3f_sys as sys;
 
 // CAMF stores eight tone-shape rows with seven values per row. The supported
@@ -26,7 +26,7 @@ pub(super) struct ModeParameters {
 }
 
 impl ModeParameters {
-    pub fn read(reader: &Reader, mode: SppMode) -> Result<Self, Error> {
+    pub fn read(reader: &Reader, mode: ColorMode) -> Result<Self, Error> {
         let name = mode.as_str();
         let matrix_name = reader
             .dng_camf_property("ColorModeCompensations", name)
@@ -43,7 +43,7 @@ impl ModeParameters {
         if matrix.iter().any(|v| !v.is_finite()) {
             return Err(invalid("invalid color-mode matrix"));
         }
-        if mode == SppMode::Standard && (matrix != IDENTITY || contrast != 0.0) {
+        if mode == ColorMode::Standard && (matrix != IDENTITY || contrast != 0.0) {
             return Err(invalid("unsupported Standard matrix or contrast"));
         }
         if reader
@@ -77,7 +77,7 @@ impl ModeParameters {
 
 fn tone_parameters(
     settings: &[f64; SETTINGS_COUNT],
-    mode: SppMode,
+    mode: ColorMode,
     contrast: f64,
 ) -> Result<ToneShape, Error> {
     if settings.iter().any(|v| !v.is_finite())
@@ -87,7 +87,7 @@ fn tone_parameters(
         return Err(invalid("invalid mode tone parameters"));
     }
     let rows = settings.as_chunks::<PARAMETERS_PER_MODE>().0;
-    if mode != SppMode::Standard && rows.iter().any(|row| row != &rows[0]) {
+    if mode != ColorMode::Standard && rows.iter().any(|row| row != &rows[0]) {
         return Err(invalid("mode-specific tone-shape rows are not supported"));
     }
     let [scale, start, end, steep1, _gamma, breakpoint, steep2] = rows[0];
@@ -130,13 +130,13 @@ mod tests {
     #[test]
     fn mode_contrast_changes_only_the_two_tone_slopes() {
         let values = settings();
-        let original = tone_parameters(&values, SppMode::Standard, 0.0).unwrap();
+        let original = tone_parameters(&values, ColorMode::Standard, 0.0).unwrap();
         for (mode, contrast) in [
-            (SppMode::Neutral, -0.3_f32 as f64),
-            (SppMode::Vivid, 0.3_f32 as f64),
-            (SppMode::Portrait, -0.25),
-            (SppMode::Landscape, 0.25),
-            (SppMode::FcBlue, 0.3_f32 as f64),
+            (ColorMode::Neutral, -0.3_f32 as f64),
+            (ColorMode::Vivid, 0.3_f32 as f64),
+            (ColorMode::Portrait, -0.25),
+            (ColorMode::Landscape, 0.25),
+            (ColorMode::FcBlue, 0.3_f32 as f64),
         ] {
             let p = tone_parameters(&values, mode, contrast).unwrap();
             let factor = 2.0_f64.powf(contrast / 2.0);
@@ -157,12 +157,12 @@ mod tests {
     fn unsupported_or_nonfinite_tone_parameters_fail() {
         let values = settings();
         for contrast in [f64::NAN, f64::INFINITY, -2.1, 2.1] {
-            assert!(tone_parameters(&values, SppMode::Neutral, contrast).is_err());
+            assert!(tone_parameters(&values, ColorMode::Neutral, contrast).is_err());
         }
         let mut changed = values;
         changed[PARAMETERS_PER_MODE + 1] += 0.1;
-        assert!(tone_parameters(&changed, SppMode::Neutral, -0.3).is_err());
-        assert!(tone_parameters(&changed, SppMode::Standard, 0.0).is_ok());
+        assert!(tone_parameters(&changed, ColorMode::Neutral, -0.3).is_err());
+        assert!(tone_parameters(&changed, ColorMode::Standard, 0.0).is_ok());
         for (index, value) in [
             (0, 2.0),
             (1, 2.0),
@@ -174,7 +174,7 @@ mod tests {
         ] {
             changed = values;
             changed[index] = value;
-            assert!(tone_parameters(&changed, SppMode::Standard, 0.0).is_err());
+            assert!(tone_parameters(&changed, ColorMode::Standard, 0.0).is_err());
         }
     }
 }

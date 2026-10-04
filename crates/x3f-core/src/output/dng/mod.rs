@@ -28,13 +28,13 @@
 //!   for 16-bit integer raws and the one all RAW engines decode.
 
 pub(crate) mod color;
+mod color_mode;
 pub(crate) mod exif;
 mod hue_sat_map;
 mod ljpeg;
 pub(crate) mod metadata;
 mod opcodes;
 mod profiles;
-mod spp;
 mod strip;
 pub(crate) mod tags;
 pub(crate) mod tiff_writer;
@@ -93,12 +93,12 @@ pub(crate) fn write_controlled(
         check_mask_destination(path, mask)?;
     }
 
-    if opts.dng_spp_mode.is_some()
+    if opts.dng_color_mode.is_some()
         && (opts.dng_look.is_some()
             || opts.dng_highlight_mapping != crate::DngHighlightMapping::Linear)
     {
         return Err(Error::InvalidData(
-            "SPP rendering requires linear mapping and no imported look".into(),
+            "Color-mode rendering requires linear mapping and no imported look".into(),
         ));
     }
     let look = opts
@@ -130,9 +130,9 @@ pub(crate) fn write_controlled(
     let calibration =
         ColorCalibration::new(reader, &wb).ok_or(Error::Library(crate::LibraryError::Argument))?;
 
-    let spp = opts
-        .dng_spp_mode
-        .map(|mode| spp::SppLook::prepare(reader, &wb, mode, control))
+    let camera_profile = opts
+        .dng_color_mode
+        .map(|mode| color_mode::CameraProfile::prepare(reader, &wb, mode, control))
         .transpose()?;
     let mut image = reader.get_image_with_control(&opts, control)?;
     on_write();
@@ -336,8 +336,8 @@ pub(crate) fn write_controlled(
     if let Some(look) = look {
         look.embed(&mut ifd0);
     }
-    if let Some(spp) = spp {
-        spp.embed(
+    if let Some(camera_profile) = camera_profile {
+        camera_profile.embed(
             reader,
             &wb,
             &calibration,

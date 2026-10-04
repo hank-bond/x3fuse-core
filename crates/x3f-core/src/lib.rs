@@ -41,6 +41,7 @@ use x3f_sys as sys;
 // we touch here (FILE / fopen / fclose / free).
 use x3f_sys::sysabi as libc;
 
+mod color_mode;
 mod conversion;
 pub mod dcp;
 mod globals;
@@ -48,9 +49,8 @@ mod icc;
 mod image;
 pub mod output;
 mod scene;
-mod spp_mode;
 
-pub use spp_mode::SppMode;
+pub use color_mode::ColorMode;
 
 pub use conversion::{convert_file, ConversionReport, ConversionStage, OutputFormat};
 pub use globals::{
@@ -160,7 +160,7 @@ pub struct ProcessOptions {
     /// Leave camera samples, calibration, exposure metadata and previews unchanged.
     /// Defaults to `None`. Cannot be combined with an imported DCP look.
     /// Does not enable recovery or change denoising and bad-pixel repair options.
-    pub dng_spp_mode: Option<SppMode>,
+    pub dng_color_mode: Option<ColorMode>,
     /// Estimate missing highlight brightness and color when writing DNG.
     /// Defaults to `false`. Merrill uses gradient-based reconstruction.
     /// Older cameras and Quattro use separate reconstruction paths.
@@ -222,7 +222,7 @@ impl Default for ProcessOptions {
             denoise_intensity: 10,
             opcodes_dir: None,
             dng_look: None,
-            dng_spp_mode: None,
+            dng_color_mode: None,
             dng_highlight_recovery: false,
             dng_recovery_mask: None,
             dng_highlight_mapping: DngHighlightMapping::default(),

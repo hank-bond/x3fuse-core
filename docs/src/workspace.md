@@ -114,7 +114,7 @@ Submodules:
   per-conversion `ProcessingInfo`. The wrapper also checks that
   conversion's recovery-mask export result.
 
-CAMF color-mode rendering uses [`spp_mode.rs`](../../crates/x3f-core/src/spp_mode.rs) for the public mode selector and [`output/dng/spp.rs`](../../crates/x3f-core/src/output/dng/spp.rs) for calibration and profile embedding. Its `mode` module reads the selected matrix and tone parameters, `tone` builds the native and Adobe tone representations, `color_dq` applies the pointwise color correction, and `look` bakes the color residual. Each module declares its algorithm constants and numerical limits before its entry points.
+Camera color-mode rendering uses [`color_mode.rs`](../../crates/x3f-core/src/color_mode.rs) for the public mode selector and [`output/dng/color_mode.rs`](../../crates/x3f-core/src/output/dng/color_mode.rs) for calibration and camera-profile embedding. Its `mode` module reads the selected matrix and tone parameters, `tone` builds the native and Adobe tone representations, `color_dq` applies the pointwise color correction, and `look` bakes the color residual. Each module declares its algorithm constants and numerical limits before its entry points.
 
 ## `crates/x3f-cli`
 
