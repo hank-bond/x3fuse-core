@@ -1,40 +1,46 @@
-//! Generate a color-mode tone response and its Adobe profile representation.
+//! Build the camera-mode tone curve and translate it for Adobe's DNG rendering.
 //!
-//! Native tone applies independently to each channel. Adobe instead maps the
-//! lowest and highest channels, then interpolates the middle channel. Inverse
-//! tone evaluation lets the look table compensate for that difference.
+//! Sigma Photo Pro applies tone separately to red, green and blue, which can
+//! change hue. Adobe applies tone to the lowest and highest channel values, then
+//! places the middle value between them to preserve hue. The color table must
+//! compensate for that difference so Adobe can reach the intended RGB result.
 
 use super::srgb_decode;
 
-// The verified Merrill branch builds its varying tone response below code 4095.
-// Higher inputs repeat the final value. This is a rendering limit, not a change
-// to the DNG's linear camera samples or recovered headroom.
+// The Merrill tone calculation uses a 0..4095 brightness scale. It stops changing
+// just below the top of that range and repeats the final value for brighter inputs.
+// This limits the rendered tone, not the raw samples or their highlight headroom.
 pub(super) const SATURATION: usize = 4095;
 
-// Native tone warps the input before its two sigmoid segments and samples the
-// resulting curve every 50 codes to form Bezier controls. Output quantization
-// uses the full unsigned 16-bit range.
+// Sigma first reshapes the brightness scale with a power curve, then applies
+// two sigmoid segments, smooth S-shaped curves with separate contrast settings.
+// Samples every 50 brightness units become Bezier control points, which define
+// the smooth curve between black and white. Round the result to 16-bit precision.
 const INPUT_WARP: f64 = 2.2;
 const CONTROL_STEP: usize = 50;
 const OUTPUT_MAX: f64 = 65535.0;
 
-// A 513-point profile curve carries neutral brightness. The look table uses a
-// finer 4096-point evaluation of the combined exposure and profile response.
+// Store overall brightness as 513 points in the DNG tone curve. Color-table
+// calculations use 4096 samples to account for that curve and Adobe's exposure
+// adjustment with finer precision.
 const PROFILE_INTERVALS: usize = 512;
 
-// Adobe joins its negative-exposure shadow line to a quadratic at one quarter
-// of the input range. The quadratic preserves slope at the join and maps white
-// to white. Its curvature coefficient is 1 / (1 - 0.25)^2.
+// With negative exposure, Adobe darkens the shadows along a straight line and
+// joins a quadratic, a curve of the form ax^2 + bx + c, at brightness 0.25.
+// The join has no abrupt slope change, and white stays white. The coefficient
+// 1 / (1 - 0.25)^2 gives the required curvature.
 const EXPOSURE_JOIN: f64 = 0.25;
 const EXPOSURE_CURVATURE: f64 = 16.0 / 9.0;
 const EXPOSURE_SLOPE_OFFSET: f64 = 0.5;
 
-// Bisection bounds inverse-exposure error below 2^-48 on the unit interval.
-// The channel-span tolerance avoids division by a nearly neutral RGB range.
+// Find the input for a desired brightness by halving the search range 48 times.
+// This reduces the search interval to 2^-48 on the 0..1 scale.
+// Treat nearly equal RGB channels as gray to avoid dividing by tiny differences.
 const INVERSE_EXPOSURE_STEPS: usize = 48;
 const NEUTRAL_SPAN_EPSILON: f64 = 1e-12;
 
-/// CAMF shape values after the selected mode's contrast compensation.
+/// Settings for the two S-shaped tone segments, including the mode's contrast.
+/// The breakpoint sets where the lower and upper segments meet.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct ToneShape {
     pub start: f64,
@@ -44,7 +50,8 @@ pub(super) struct ToneShape {
     pub upper_steepness: f64,
 }
 
-/// Generate the normal color branch from the selected CAMF tone shape.
+/// Build the color-mode tone response from the file's settings, before encoding
+/// it as a DNG profile curve. Returned values use a linear 0..1 brightness scale.
 pub(super) fn native_tone(shape: ToneShape) -> Vec<f64> {
     let ToneShape {
         start,
@@ -79,7 +86,8 @@ pub(super) fn native_tone(shape: ToneShape) -> Vec<f64> {
         .collect()
 }
 
-/// Carry neutral brightness without changing neutral look-table value scales.
+/// Store overall brightness in the profile curve while the color table leaves
+/// gray entries unchanged. Account for Adobe's separate exposure adjustment.
 pub(super) fn profile_curve(tone: &[f64], neutral_scale: f64, exposure: f64) -> Vec<f32> {
     (0..=PROFILE_INTERVALS)
         .flat_map(|i| {
@@ -108,6 +116,9 @@ pub(super) fn curve_at(curve: &[f32], x: f64) -> f64 {
     lo + (hi - lo) * (p - i as f64)
 }
 
+/// Model Adobe's negative-exposure adjustment, which darkens shadows but keeps
+/// white unchanged. Positive exposure is handled before the color table, so this
+/// part of the tone calculation leaves those inputs unchanged.
 pub(super) fn exposure_tone(x: f64, exposure: f64) -> f64 {
     if exposure >= 0.0 {
         return x;
@@ -122,6 +133,9 @@ pub(super) fn exposure_tone(x: f64, exposure: f64) -> f64 {
     (a * x + b) * x + c
 }
 
+/// Find the RGB inputs that Adobe's hue-preserving tone step needs to produce
+/// the requested output. Undo its treatment of the middle channel as well as
+/// its changes to the lowest and highest channel values.
 pub(super) fn inverse_rgb_tone(rgb: [f64; 3], tone: &[f64]) -> [f64; 3] {
     let low = rgb.into_iter().fold(f64::INFINITY, f64::min);
     let high = rgb.into_iter().fold(0.0, f64::max);
@@ -213,7 +227,8 @@ mod tests {
             let curve = profile_curve(&tone, scale, exposure);
             assert_eq!(&curve[..2], &[0.0, 0.0]);
             assert_eq!(&curve[curve.len() - 2..], &[1.0, 1.0]);
-            // The native shoulder reaches a constant tail. Adobe permits this.
+            // The curve flattens near white. Adobe allows consecutive points
+            // to have the same output brightness.
             assert!(curve
                 .windows(4)
                 .step_by(2)

@@ -152,7 +152,8 @@ fn usage(progname: &str) -> ! {
          \x20  -dng-color-mode <MODE> Embed a camera profile from X3F color-mode metadata.\n\
          \x20                  Supported cameras: DP1, DP2 and DP3 Merrill.\n\
          \x20                  Standard, Neutral, Vivid, Portrait, Landscape or FCBlue.\n\
-         \x20                  WB: Auto, Daylight or Sunlight. Source: sRGB or AdobeRGB.\n\
+         \x20                  WB: any preset with calibration in the file.\n\
+         \x20                  Source: sRGB or AdobeRGB.\n\
          \x20  -dng-look <FILE> Embed a DCP look table and tone curve in the DNG.\n\
          \x20                  Leaves calibration and the thumbnail unchanged.\n\
          \x20  -dng-highlight-recovery\n\

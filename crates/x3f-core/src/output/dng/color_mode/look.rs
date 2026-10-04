@@ -1,8 +1,9 @@
-//! Bake the pointwise color residual around Adobe's exposure and tone operations.
+//! Build the color lookup table that works alongside Adobe's exposure and tone curve.
 //!
-//! The table uses hue, saturation, and sRGB-encoded value coordinates. It changes
-//! rendering metadata only. Black and neutral entries remain identity transforms,
-//! while the separate profile curve carries neutral brightness.
+//! The table stores the remaining color changes needed to reach the camera-mode
+//! response after accounting for Adobe's rendering. Each entry changes hue,
+//! saturation and value, the brightness component of HSV. Black and gray entries
+//! do nothing, since the separate tone curve controls their brightness.
 
 use super::{
     color_dq::ColorDq,
@@ -12,31 +13,33 @@ use super::{
 use crate::Error;
 use x3f_sys::Control;
 
-// Coarse hue, saturation, and value sampling. These dimensions control table
-// size and interpolation error, not the strength of the native correction.
+// Sample 72 hues, 33 saturation levels and 65 brightness levels. Between samples,
+// the reader interpolates, blending nearby entries. A larger table reduces that
+// approximation error but does not make the color correction stronger.
 pub(super) const DIMS: [u32; 3] = [72, 33, 65];
 
-// DNG encoding 1 spaces value samples in encoded sRGB rather than linear RGB.
-// The dense shadow sampling matters for the small ColorDQ correction.
+// DNG encoding 1 spaces brightness samples using the sRGB display curve. This
+// puts more samples in the shadows, where the small ColorDQ correction matters.
 pub(super) const ENCODING_SRGB: u32 = 1;
 
-// A nearly neutral RGB triplet has no stable hue. Keep its hue shift zero.
-// These tolerances avoid divisions by tiny channel spans and saturation values.
+// Gray has no meaningful hue. Treat nearly equal RGB values as gray to avoid
+// dividing by tiny channel differences and inventing a large hue change.
 const NEUTRAL_SPAN_EPSILON: f64 = 1e-12;
 const HUE_SATURATION_EPSILON: f64 = 1e-7;
 const DEGREES_PER_TURN: f64 = 360.0;
 
-// HSV has six hue sectors. Offsets select the red, green, and blue triangle
-// waves. The falling triangle edge starts at sector four. The two non-red
-// hue branches start at sectors two and four.
+// HSV describes color as hue, saturation and value. Hue makes one turn through
+// six sectors: red, yellow, green, cyan, blue and magenta. These offsets position
+// the RGB channel peaks and the rising and falling edges between those peaks.
 const HUE_SECTORS: f64 = 6.0;
 const RGB_HUE_OFFSETS: [f64; 3] = [5.0, 3.0, 1.0];
 const TRIANGLE_FALLING_OFFSET: f64 = 4.0;
 const GREEN_HUE_SECTOR: f64 = 2.0;
 const BLUE_HUE_SECTOR: f64 = 4.0;
 
-/// Bake a table using the camera adapter after Adobe's positive-exposure ramp.
-/// Supply the combined exposure and profile response as the effective tone.
+/// Calculate the color table for inputs that Adobe has already exposure-adjusted.
+/// The adapter maps those inputs back to the camera's color and brightness scale.
+/// Supply Adobe's combined exposure adjustment and profile curve as `effective_tone`.
 pub(super) fn bake(
     adapter: &[f64; 9],
     output: &[f64; 9],
@@ -55,6 +58,8 @@ pub(super) fn bake(
             for s in 0..ns {
                 let sat = s as f64 / (ns - 1) as f64;
                 if v == 0 || s == 0 {
+                    // Leave gray brightness to the tone curve. Black has no color
+                    // to correct. These entries apply no hue, saturation or value change.
                     table.extend([0.0, 1.0, 1.0]);
                     continue;
                 }
@@ -65,6 +70,8 @@ pub(super) fn bake(
                     counts.map(|x| tone_at(tone, x / SATURATION as f64) / tone[SATURATION]),
                 )
                 .map(|x| x.clamp(0.0, 1.0));
+                // Find the RGB values that Adobe's later tone curve will turn
+                // into the desired result. This avoids applying tone twice.
                 let target = inverse_rgb_tone(target, effective_tone);
                 let [target_hue, target_saturation, target_value] = rgb_to_hsv(target);
                 let shift = if target_saturation < HUE_SATURATION_EPSILON {

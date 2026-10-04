@@ -1,4 +1,4 @@
-//! Resolve a color mode's matrix, tone shape and contrast from CAMF.
+//! Read the selected color mode's color and tone settings from the X3F metadata.
 
 use super::{
     invalid,
@@ -7,15 +7,15 @@ use super::{
 use crate::{ColorMode, Error, Reader};
 use x3f_sys as sys;
 
-// CAMF stores eight tone-shape rows with seven values per row. The supported
-// color-mode data shares all rows. Standard uses row zero. Reject differing
-// rows for other modes rather than guessing an application mode-to-row mapping.
+// The file stores eight rows of seven tone settings. Standard uses the first
+// row. Other modes can reuse it only when every row agrees. If the rows differ,
+// reject the file rather than guessing which settings belong to the chosen mode.
 const TONE_MODE_COUNT: usize = 8;
 const PARAMETERS_PER_MODE: usize = 7;
 const SETTINGS_COUNT: usize = TONE_MODE_COUNT * PARAMETERS_PER_MODE;
 
-// The normal native tone generator scales both slopes by exp2(contrast / 2).
-// Accept mode offsets within the native contrast slider's bounded range.
+// Sigma changes contrast by multiplying both tone-curve slopes by
+// 2 raised to (contrast / 2). Accept offsets within its slider's -2..2 range.
 const CONTRAST_LIMIT: f64 = 2.0;
 const CONTRAST_DIVISOR: f64 = 2.0;
 const IDENTITY: [f64; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
@@ -46,6 +46,8 @@ impl ModeParameters {
         if mode == ColorMode::Standard && (matrix != IDENTITY || contrast != 0.0) {
             return Err(invalid("unsupported Standard matrix or contrast"));
         }
+        // MultiAxisTable entries describe additional hue and saturation changes,
+        // not just a color matrix and contrast. Do not silently leave them out.
         if reader
             .dng_camf_multi_axis_table(&format!("MultiAxisTable_{name}"))
             .is_some()
@@ -53,7 +55,8 @@ impl ModeParameters {
             return Err(invalid("multi-axis color modes are not supported"));
         }
         let mut settings = [0.0; SETTINGS_COUNT];
-        // SAFETY: the loaded reader owns CAMF and the output matches both dimensions.
+        // SAFETY: the reader owns the loaded metadata. The accessor checks the
+        // requested dimensions, and settings has room for all eight rows.
         let valid = unsafe {
             sys::x3f_get_camf_matrix(
                 reader.x3f.as_ptr(),

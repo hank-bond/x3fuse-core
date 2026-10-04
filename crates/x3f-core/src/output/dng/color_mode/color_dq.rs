@@ -1,35 +1,39 @@
-//! Apply the bounded ColorDQ correction in post-camera-matrix code units.
+//! Apply ColorDQ, Sigma's small per-pixel color correction, before the tone curve.
 //!
-//! The correction depends on the three channels of one pixel, not its neighbors.
-//! Equal-channel inputs stay neutral. The setup gain changes input coordinates,
-//! not the correction amplitude.
+//! ColorDQ uses the three channels of one pixel, not neighboring pixels. It works
+//! after the camera's color matrix, on the tone calculation's 0..4095 brightness
+//! scale. Its tables also accept negative and above-white values. Brightening
+//! the input does not by itself increase the correction's strength.
 
 use super::invalid;
 use crate::Error;
 
-// Native amplitude scaling uses float ISO division and stops increasing at 4.
-// Keep this separate from the additional setup gain in the metadata adapter.
+// Sigma scales the correction strength by the capture-to-sensor ISO ratio,
+// calculated with 32-bit floats and capped at four. The extra one-stop brightness
+// gain in the camera profile must not also multiply this strength.
 pub(super) const MAX_ISO_GAIN: f32 = 4.0;
 
-// Limit malformed calibration values before generating signed correction tables.
-// This is a validation bound in native code units, not a strength control.
+// Reject correction strengths above 1024 brightness units before building the
+// table. This bounds the metadata accepted here, not a user-adjustable setting.
 const MAX_AMPLITUDE: f64 = 1024.0;
 
-// The native tanh slope controls the correction near zero. The phase scale
-// controls how the cosine envelope reduces that correction at larger distances.
+// tanh, the hyperbolic tangent, is a smooth S-shaped function that controls the
+// correction near zero. A cosine envelope, a smooth taper down to zero, reduces
+// the correction farther from zero. PHASE_SCALE controls that taper's width.
 const TANH_SHAPE: f64 = 0.8;
 const PHASE_SCALE: f64 = 0.25;
 
-// Preserve the native support constants exactly. Substituting mathematical pi
-// or tau changes table entries near the envelope boundary.
+// Keep Sigma's exact stored constants for the taper cutoff and table span.
+// Substituting exact pi or 2*pi changes rounding near the taper's edge.
 const PHASE_CUTOFF: f64 = f64::from_bits(0x400921ff2e48e8a7);
 const TABLE_SPAN: f64 = f64::from_bits(0x40192425aee631f9);
 const TABLE_PERIODS: [usize; 5] = [512, 1024, 2048, 4096, 8192];
 const MAX_TABLE_PERIOD: usize = 8192;
 
-// Native integer lookup uses biased-double rounding and a signed low word.
-// The small bias resolves half-code ties. Replacing this with round() changes
-// signed boundary cases and the periodic lookup coordinates.
+// Sigma rounds by adding a large floating-point constant and reading the low
+// 32 bits as a signed integer. The small bias settles halfway cases. Keep this
+// method rather than round(), which differs for some negative and halfway inputs
+// and would therefore choose different correction-table entries.
 const ROUNDING_BIAS: f64 = f64::from_bits(0x3e501b2b29a4692b);
 const ROUNDING_MAGIC: f64 = f64::from_bits(0x4338000000000000);
 
@@ -38,7 +42,8 @@ pub(super) struct ColorDq {
 }
 
 impl ColorDq {
-    /// Build the tables from ISO-scaled CAMF amplitudes in native code units.
+    /// Build the correction table from the file's per-channel strengths after ISO
+    /// scaling. Strengths and inputs use the same 0..4095 brightness scale.
     pub(super) fn new(amplitudes: [f64; 3]) -> Result<Self, Error> {
         if amplitudes
             .iter()
@@ -79,15 +84,18 @@ impl ColorDq {
         Ok(Self { table })
     }
 
-    /// Correct one finite post-matrix pixel before applying the tone curve.
+    /// Correct one pixel after the camera color matrix and before the tone curve.
+    /// Supply finite channel values on the 0..4095 scale, not 16-bit display RGB.
     pub(super) fn apply(&self, values: [f64; 3]) -> [f64; 3] {
         let mask = self.table.len() - 1;
         let rounded =
             values.map(|v| ((v + ROUNDING_BIAS + ROUNDING_MAGIC).to_bits() as u32 as i32) as i64);
         let residual: [i64; 3] =
             std::array::from_fn(|c| rounded[c] - self.table[rounded[c] as usize & mask][c] as i64);
-        // The native residual mean weights the middle channel twice.
-        // The signed shift rounds negative means toward negative infinity.
+        // Estimate the shared brightness from the values left after the first
+        // table lookup. Sigma gives the middle channel twice the weight of the
+        // other channels. Shifting divides by four and rounds downward, including
+        // for negative values, so ordinary integer division is not equivalent.
         let mean = (residual[0] + 2 * residual[1] + residual[2]) >> 2;
         std::array::from_fn(|c| {
             values[c] - self.table[(residual[c] - mean) as usize & mask][c] as f64
@@ -101,7 +109,9 @@ mod tests {
 
     #[test]
     fn colordq_matches_native_tables_and_points() {
-        // FNV-1a over the native signed tables, expanded to little-endian i32.
+        // These FNV-1a checksums summarize every byte in Sigma's correction tables.
+        // Encode each signed entry as a little-endian 32-bit integer so even a
+        // one-entry rounding difference changes the checksum.
         for (amplitudes, expected) in [
             ([7.9921875; 3], 0xa12aaac649ea2818_u64),
             ([16.0; 3], 0x0a85ba2d5d7293e9_u64),

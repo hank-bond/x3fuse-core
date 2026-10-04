@@ -153,13 +153,18 @@ pub struct ProcessOptions {
     /// default DNG profile, regardless of camera model. Leaves calibration,
     /// raw samples, and the thumbnail unchanged. Defaults to `None`.
     pub dng_look: Option<std::path::PathBuf>,
-    /// Optional CAMF-derived color mode for DP1, DP2 and DP3 Merrill DNG output.
-    /// Use the file's Auto, Daylight or Sunlight calibration and require linear
-    /// highlight mapping. The source color-space property selects native sRGB or
-    /// Adobe RGB routing. Auto uses stored calibration, not a new WB estimate.
-    /// Leave camera samples, calibration, exposure metadata and previews unchanged.
-    /// Defaults to `None`. Cannot be combined with an imported DCP look.
-    /// Does not enable recovery or change denoising and bad-pixel repair options.
+    /// Embed a camera profile for the selected DP1, DP2 or DP3 Merrill color mode.
+    /// Build it from CAMF, the camera metadata stored in the X3F. Any white-balance
+    /// preset with valid calibration in the file can be used. Auto uses the saved
+    /// calibration rather than estimating white balance again.
+    ///
+    /// The file's sRGB or Adobe RGB setting chooses the profile's internal color
+    /// conversion, not the reader's output space. Raw samples, camera calibration,
+    /// exposure metadata and previews stay unchanged with the same processing options.
+    ///
+    /// Defaults to `None`, leaving conversion unchanged. Requires linear highlight
+    /// mapping and cannot be combined with `dng_look`. Selecting a mode does not
+    /// enable recovery or change the denoising and bad-pixel repair settings.
     pub dng_color_mode: Option<ColorMode>,
     /// Estimate missing highlight brightness and color when writing DNG.
     /// Defaults to `false`. Merrill uses gradient-based reconstruction.

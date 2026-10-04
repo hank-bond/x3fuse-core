@@ -1,10 +1,11 @@
-//! Color-mode selection for CAMF-derived DNG rendering metadata.
+//! Select a camera color mode when building a DNG profile from X3F metadata.
 
 use crate::Error;
 use std::{fmt, str::FromStr};
 
-/// Camera color mode to embed without changing the linear camera samples.
-/// Availability depends on the selected mode's calibration in the X3F.
+/// Choose the camera's color and tone settings without changing the raw samples.
+/// Use with `ProcessOptions::dng_color_mode`. The X3F must contain calibration for
+/// the selected mode, so not every file supports every variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorMode {
     /// Standard color and tone.
@@ -22,7 +23,7 @@ pub enum ColorMode {
 }
 
 impl ColorMode {
-    /// Mode name used by CAMF property lists and the CLI selector.
+    /// Return the exact preset name used by the X3F metadata and CLI selector.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Standard => "Standard",

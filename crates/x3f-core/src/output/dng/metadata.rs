@@ -5,9 +5,8 @@
 //! corresponding tag or, in a few cases, hard-failing the conversion). The
 //! caller decides which behaviour to apply.
 //!
-//! The 3×3 matrix helpers are exposed alongside because they're used in the
-//! same call-chains; a future native port of `x3f_matrix.c` can replace
-//! these without touching the writer.
+//! The matrix helpers here support the writer's color conversions. A 3×3 matrix
+//! mixes three input channels into three output channels.
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -41,7 +40,8 @@ impl Reader {
         Some(s.to_string_lossy().into_owned())
     }
 
-    /// Resolve a named entry through a CAMF property list.
+    /// Look up a name in a CAMF list and copy the corresponding value.
+    /// For example, a white-balance list maps Shade to its calibration entry name.
     pub(crate) fn dng_camf_property(&self, list: &str, key: &str) -> Option<String> {
         let list = cstr(list);
         let key = cstr(key);
@@ -106,7 +106,9 @@ impl Reader {
         (ok != 0).then_some(buf)
     }
 
-    /// Resolve a 3×3 CAMF matrix through the selected white-balance property list.
+    /// Read the color matrix named by the selected white-balance preset.
+    /// The CAMF list maps preset names to calibration entries. If Daylight is
+    /// absent, the existing accessor tries Sunlight instead.
     pub(crate) fn dng_camf_wb_matrix_3x3(&self, list: &str, wb: &str) -> Option<[f64; 9]> {
         let list = cstr(list);
         let wb = cstr(wb);

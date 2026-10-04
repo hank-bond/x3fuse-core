@@ -1,13 +1,15 @@
-//! Embed a CAMF-derived color mode without changing linear camera samples.
+//! Build a DNG camera profile from the color-mode settings stored in the X3F.
 //!
-//! DP1, DP2 and DP3 Merrill share this rendering recipe. Each file supplies its
-//! camera matrix and gains for the selected white balance. Its source color-space
-//! property selects native sRGB or Adobe RGB routing, not the renderer's output.
+//! DP1, DP2 and DP3 Merrill use the same calculation with each file's calibration.
+//! The profile contains a color lookup table and a tone curve, leaving the raw
+//! samples untouched. The lookup table accounts for the color and exposure changes
+//! that Adobe applies before using the profile. It also includes ColorDQ, Sigma's
+//! per-pixel color correction, which does not use neighboring pixels.
 //!
-//! The camera adapter maps Adobe's rendering coordinates into the native tone
-//! and ColorDQ input range. A separate profile curve carries neutral brightness.
-//! Spatial processing, including white-balance color shading, stays upstream.
-//! This recipe does not reproduce the full Sigma Photo Pro pipeline.
+//! The file's sRGB or Adobe RGB setting chooses the color conversion used to build
+//! the profile. It does not choose the DNG reader's output space. Denoising, repair,
+//! color shading and recovery still run before rendering. This profile does not
+//! reproduce the full Sigma Photo Pro pipeline.
 
 mod color_dq;
 mod look;
@@ -29,25 +31,29 @@ use tone::{curve_at, exposure_tone, profile_curve, SATURATION};
 
 // Rendering setup
 
-// The supported native setup branch adds one stop before ColorDQ and tone.
-// This gain belongs in rendering metadata, not in the stored camera samples.
+// The Sigma Photo Pro setup used by this recipe doubles brightness before its
+// color correction and tone curve. Store that one-stop gain in the profile so
+// the raw samples keep their original brightness and highlight headroom.
 const SETUP_GAIN: f64 = 2.0;
 
-// Match the writer's rounding for ForwardMatrix and BaselineExposure. Baking
-// against unrounded calibration produces a different look in the Adobe SDK.
+// ForwardMatrix describes camera-to-color conversion, and BaselineExposure
+// sets the DNG's default brightness. Both tags store rounded numbers. Build the
+// profile with those same numbers, since they are what the reader actually uses.
 const TAG_DENOMINATOR: i32 = 10000;
 
-// Adobe's profile connection space uses this D50 white and the ROMM primaries.
-// Normalize matrix rows to that white before deriving the camera adapter.
+// Adobe evaluates the profile in a working space with ProPhoto RGB primaries,
+// also called ROMM RGB. D50 is its reference white, roughly 5000 K daylight.
+// Scale the matrix rows so white agrees between the camera and that working space.
 const PCS_WHITE: [f64; 3] = [0.3457 / 0.3585, 1.0, (1.0 - 0.3457 - 0.3585) / 0.3585];
 const ROMM: [f64; 9] = [
     0.7977, 0.1352, 0.0313, 0.2880, 0.7119, 0.0001, 0.0, 0.0, 0.8249,
 ];
 
-// Native Adobe RGB to ROMM conversion at zero saturation adjustment. Native
-// source 3 selects Adobe RGB, and destination 11 selects ROMM. These are the
-// native 12-bit fixed-point coefficients, not a replacement camera calibration.
-// Preserve the slight row-sum difference caused by native quantization.
+// Sigma Photo Pro uses these coefficients to convert Adobe RGB to ROMM RGB
+// with no saturation adjustment. Its source and destination IDs are 3 and 11.
+// The coefficients are stored as integers divided by 4096. Keep that rounding,
+// including the slightly uneven row sums, to preserve its color conversion.
+// This matrix does not replace the camera's own calibration.
 const MATRIX_SCALE: f64 = 4096.0;
 const ADOBE_TO_ROMM: [f64; 9] = [
     3032.0 / MATRIX_SCALE,
@@ -61,8 +67,8 @@ const ADOBE_TO_ROMM: [f64; 9] = [
     3697.0 / MATRIX_SCALE,
 ];
 
-// Native source 2 selects sRGB. Select this matrix for an sRGB camera property,
-// independently of the DNG renderer's output color space.
+// Source ID 2 is Sigma Photo Pro's sRGB conversion. Choose it when the X3F says
+// sRGB, even if the DNG reader will render to a different output color space.
 const SRGB_TO_ROMM: [f64; 9] = [
     2168.0 / MATRIX_SCALE,
     1352.0 / MATRIX_SCALE,
@@ -75,9 +81,9 @@ const SRGB_TO_ROMM: [f64; 9] = [
     3546.0 / MATRIX_SCALE,
 ];
 
-// Standard sRGB transfer constants serve two different boundaries: native
-// tone decoding and DNG look-table value encoding. They do not reinterpret
-// the camera samples as sRGB.
+// The sRGB transfer curve relates linear brightness to display-encoded values.
+// Use it to decode Sigma's tone response and to space the DNG table's brightness
+// samples. This does not apply an sRGB curve to the stored camera samples.
 const SRGB_ENCODED_JOIN: f64 = 0.04045;
 const SRGB_LINEAR_JOIN: f64 = 0.0031308;
 const SRGB_SLOPE: f64 = 12.92;
@@ -97,9 +103,9 @@ pub(super) struct CameraProfile {
 }
 
 impl CameraProfile {
-    /// Capture calibration before processing changes the decoded sensor raster.
-    /// Resolve Auto, Daylight or Sunlight calibration from the file's CAMF lists.
-    /// Auto selects stored calibration rather than estimating a new white balance.
+    /// Read calibration while the decoded sensor samples are still unprocessed.
+    /// Use the requested white-balance preset from CAMF, the X3F's camera metadata.
+    /// Auto uses the file's saved calibration rather than estimating white balance.
     pub(super) fn prepare(
         reader: &Reader,
         wb: &str,
@@ -110,20 +116,18 @@ impl CameraProfile {
         if !matches!(
             reader.dng_prop("CAMMODEL").as_deref(),
             Some("SIGMA DP1 Merrill" | "SIGMA DP2 Merrill" | "SIGMA DP3 Merrill")
-        ) || !matches!(wb, "Auto" | "Daylight" | "Sunlight")
-        {
-            return Err(invalid(
-                "requires DP Merrill Auto, Daylight or Sunlight calibration",
-            ));
+        ) {
+            return Err(invalid("requires DP Merrill calibration"));
         }
         let mut camera = reader
             .dng_camf_wb_matrix_3x3("WhiteBalanceColorCorrections", wb)
             .ok_or_else(|| invalid("missing selected white-balance matrix"))?;
         let parameters = ModeParameters::read(reader, mode)?;
         if mode != ColorMode::Standard {
-            // Native stage 2 right-multiplies the camera matrix by the mode matrix
-            // before ColorDQ. This metadata path preserves that pointwise order
-            // but does not move the mode inside upstream denoising or recovery.
+            // Sigma Photo Pro combines white-balance and color-mode calibration
+            // before ColorDQ: combined = camera matrix * mode matrix. Keep that
+            // multiplication order. Unlike Sigma's processing, the embedded profile
+            // applies the result after the converter's denoising and recovery.
             camera = mat3_mul(&camera, &parameters.matrix);
         }
         let output_matrix = source_to_romm(reader.dng_prop("COLORSPACE").as_deref())?;
@@ -148,7 +152,7 @@ impl CameraProfile {
                 && sys::get_black_level(
                     reader.x3f.as_ptr(),
                     &mut area,
-                    1, // Match preprocessing's shield-rectangle scaling.
+                    1, // Match how preprocessing maps the covered black-reference pixels.
                     3, // Merrill has three measured layers.
                     black.as_mut_ptr(),
                     deviation.as_mut_ptr(),
@@ -180,8 +184,9 @@ impl CameraProfile {
             return Err(invalid("invalid calibration"));
         }
         let tone = parameters.tone;
-        // Native ColorDQ uses float ISO division. The additional setup gain
-        // changes its input coordinates, not its correction amplitude.
+        // Sigma computes the ISO ratio with 32-bit floats to set ColorDQ strength.
+        // Keep that rounding. The extra one-stop gain brightens the values fed into
+        // ColorDQ, but it must not also increase the correction's strength.
         let dq_iso = (capture as f32 / sensor as f32).min(color_dq::MAX_ISO_GAIN) as f64;
         let dq = ColorDq::new(amplitudes.map(|v| v * dq_iso))?;
         control.check()?;
@@ -197,8 +202,8 @@ impl CameraProfile {
         })
     }
 
-    /// Embed the camera profile using the DNG's published calibration and scale.
-    /// Leave raw samples, camera calibration, exposure tags, and previews unchanged.
+    /// Add the camera profile using the calibration and exposure stored in the DNG.
+    /// Do not change raw samples, camera calibration, exposure tags or previews.
     pub(super) fn embed(
         &self,
         reader: &Reader,
@@ -227,8 +232,9 @@ impl CameraProfile {
                 .ok_or_else(|| invalid("invalid exposure"))?;
         let (n, d) = profiles::srational_pair(exposure as f32 as f64, TAG_DENOMINATOR);
         let published_exposure = n as f64 / d as f64;
-        // The LUT input follows Adobe's positive-exposure ramp. Restore this
-        // DNG's published headroom and apply the native setup gain exactly once.
+        // Adobe applies positive BaselineExposure before the color lookup table.
+        // Account for that existing gain rather than applying it twice. The table
+        // must also account for stored highlight headroom and Sigma's one-stop gain.
         let ramp_gain = 2.0_f64.powf(published_exposure.max(0.0));
         let ratio = SETUP_GAIN * 2.0_f64.powf(published_exposure) / ramp_gain;
         let sensor_scale = std::array::from_fn(|i| {
@@ -245,9 +251,10 @@ impl CameraProfile {
         if !neutral_scale.is_finite() || neutral_scale <= 0.0 {
             return Err(invalid("invalid neutral coordinate scale"));
         }
-        // Adobe requires neutral look-table value scales to remain one.
-        // Carry neutral brightness in the tone curve instead. Its input follows
-        // Adobe's separate, white-preserving negative-exposure tone adjustment.
+        // Adobe requires the color table to leave gray brightness unchanged.
+        // Put overall brightness in the tone curve instead. When BaselineExposure
+        // is negative, Adobe darkens the shadows but keeps white at white. Build
+        // the curve to account for that adjustment.
         let curve = profile_curve(&self.tone, neutral_scale, published_exposure);
         let effective_tone: Vec<f64> = (0..=SATURATION)
             .map(|i| {
@@ -305,7 +312,8 @@ fn normalize_white(m: [f64; 9]) -> [f64; 9] {
 }
 
 fn mul(m: &[f64; 9], v: [f64; 3]) -> [f64; 3] {
-    // Preserve the accumulation order used by the baked reference.
+    // Keep the same multiply-and-add order as the reference profile so rounding
+    // does not change the generated table.
     std::array::from_fn(|r| m[r * 3].mul_add(v[0], m[r * 3 + 1].mul_add(v[1], m[r * 3 + 2] * v[2])))
 }
 
@@ -336,6 +344,135 @@ mod tests {
         assert_ne!(SRGB_TO_ROMM, ADOBE_TO_ROMM);
         for space in [None, Some(""), Some("ProPhoto"), Some("unknown")] {
             assert!(source_to_romm(space).is_err());
+        }
+    }
+
+    #[test]
+    fn camera_profiles_use_every_white_balance_in_the_file() {
+        let directory = std::env::var_os("X3F_TEST_FILES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../x3f_test_files")
+            });
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            eprintln!("skip: set X3F_TEST_FILES for file-provided white-balance checks");
+            return;
+        };
+        let mut paths: Vec<_> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("x3f"))
+            })
+            .collect();
+        paths.sort();
+        let mut models = std::collections::HashSet::new();
+        for path in paths {
+            let mut reader = Reader::open(&path).unwrap();
+            reader.load_property_list().unwrap();
+            let Some(model) = reader.dng_prop("CAMMODEL") else {
+                continue;
+            };
+            if !matches!(
+                model.as_str(),
+                "SIGMA DP1 Merrill" | "SIGMA DP2 Merrill" | "SIGMA DP3 Merrill"
+            ) || !models.insert(model.clone())
+            {
+                continue;
+            }
+            reader.load_camf().unwrap();
+            reader.load_raw().unwrap();
+            let mut names = std::ptr::null_mut();
+            let mut values = std::ptr::null_mut();
+            let mut count = 0;
+            // SAFETY: the loaded reader owns the list and returned strings.
+            let found = unsafe {
+                sys::x3f_get_camf_property_list(
+                    reader.x3f.as_ptr(),
+                    c"WhiteBalanceColorCorrections".as_ptr() as *mut _,
+                    &mut names,
+                    &mut values,
+                    &mut count,
+                )
+            };
+            assert_ne!(found, 0);
+            assert!(count > 0 && !names.is_null());
+            // SAFETY: a successful accessor returns count reader-owned names.
+            let presets: Vec<_> = unsafe { std::slice::from_raw_parts(names, count as usize) }
+                .iter()
+                .map(|&name| {
+                    // SAFETY: CAMF list names are NUL-terminated strings.
+                    unsafe { std::ffi::CStr::from_ptr(name) }
+                        .to_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect();
+            let mut checked = 0;
+            for wb in &presets {
+                let matrix_name = reader
+                    .dng_camf_property("WhiteBalanceColorCorrections", wb)
+                    .unwrap();
+                let wb_matrix = reader.dng_camf_matrix_3x3(&matrix_name).unwrap();
+                let gain = reader.dng_gain(Some(wb)).unwrap();
+                for mode in [
+                    ColorMode::Standard,
+                    ColorMode::Neutral,
+                    ColorMode::Vivid,
+                    ColorMode::Portrait,
+                    ColorMode::Landscape,
+                    ColorMode::FcBlue,
+                ] {
+                    if reader
+                        .dng_camf_property("ColorModeCompensations", mode.as_str())
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    let parameters = ModeParameters::read(&reader, mode).unwrap();
+                    let profile = CameraProfile::prepare(&reader, wb, mode, Control::none())
+                        .unwrap_or_else(|error| panic!("{model} {wb} {mode}: {error}"));
+                    let expected = if mode == ColorMode::Standard {
+                        wb_matrix
+                    } else {
+                        mat3_mul(&wb_matrix, &parameters.matrix)
+                    };
+                    assert_eq!(profile.camera, expected);
+                    assert_eq!(profile.gain, gain);
+                    checked += 1;
+                }
+            }
+            if presets.iter().any(|wb| wb == "Sunlight") {
+                let daylight = CameraProfile::prepare(
+                    &reader,
+                    "Daylight",
+                    ColorMode::Standard,
+                    Control::none(),
+                )
+                .unwrap();
+                let sunlight = CameraProfile::prepare(
+                    &reader,
+                    "Sunlight",
+                    ColorMode::Standard,
+                    Control::none(),
+                )
+                .unwrap();
+                assert_eq!(daylight.camera, sunlight.camera);
+                assert_eq!(daylight.gain, sunlight.gain);
+            }
+            assert!(CameraProfile::prepare(
+                &reader,
+                "MissingCalibration",
+                ColorMode::Standard,
+                Control::none(),
+            )
+            .is_err());
+            eprintln!("{model}: {presets:?}, {checked} color-mode calibrations checked");
+        }
+        if models.is_empty() {
+            eprintln!("skip: no supported DP Merrill files in the corpus");
         }
     }
 
